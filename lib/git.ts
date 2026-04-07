@@ -521,6 +521,183 @@ async function extractFirstPrompt(
 }
 
 /**
+ * Extract the `cwd` from the first parseable line of a JSONL session file.
+ * Used by the global scanner to recover the original absolute path
+ * without decoding the project directory name (which is lossy).
+ */
+async function extractCwd(jsonlPath: string): Promise<string | null> {
+  try {
+    const content = await Bun.file(jsonlPath).text()
+    for (const line of content.split("\n").slice(0, 10)) {
+      if (!line.trim()) continue
+      try {
+        const entry = JSON.parse(line)
+        if (entry.cwd) return entry.cwd
+      } catch {
+        /* skip malformed */
+      }
+    }
+  } catch {
+    /* file read failed */
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Global session scanner
+// ---------------------------------------------------------------------------
+
+/** A single project directory from ~/.claude/projects/ with session metadata. */
+export interface GlobalProjectEntry {
+  /** The original absolute working directory (extracted from JSONL cwd field). */
+  cwd: string
+  /** Whether this is a Claude Code worktree (path contains .claude/worktrees/). */
+  isWorktree: boolean
+  /** The repo root (path before /.claude/worktrees/, or the cwd itself for main repos). */
+  repoRoot: string
+  /** Worktree name (segment after .claude/worktrees/), null for main repo sessions. */
+  worktreeName: string | null
+  /** Number of session JSONL files. */
+  sessionCount: number
+  /** First user prompt from the most recent session. */
+  latestPrompt: string
+  /** ISO timestamp from the most recent session's first user message. */
+  latestTimestamp: string
+}
+
+/** Sessions grouped by repo root. */
+export interface GlobalRepoGroup {
+  repoRoot: string
+  /** Session entry for the main repo (non-worktree), if any. */
+  main: GlobalProjectEntry | null
+  /** Worktree session entries. */
+  worktrees: GlobalProjectEntry[]
+  /** Total sessions across main + all worktrees. */
+  totalSessions: number
+}
+
+/**
+ * Scan ~/.claude/projects/ for all Claude Code sessions across all repos.
+ * Groups results by repo root. Excludes the specified repo (usually the
+ * current repo, which is already shown in the main worktree list).
+ *
+ * Returns empty array if ~/.claude doesn't exist or has no sessions.
+ * Never throws.
+ */
+export async function listGlobalClaudeSessions(
+  excludeRepoRoot?: string,
+): Promise<GlobalRepoGroup[]> {
+  const home = process.env.HOME
+  if (!home) return []
+
+  const projectsDir = `${home}/.claude/projects`
+
+  try {
+    const { readdir, stat } = await import("node:fs/promises")
+    const dirs = await readdir(projectsDir).catch(() => null)
+    if (!dirs || dirs.length === 0) return []
+
+    // Process each project directory concurrently
+    const entries: GlobalProjectEntry[] = []
+    const CONCURRENCY = 8
+    const executing: Promise<void>[] = []
+
+    const processDir = async (dirName: string) => {
+      const dirPath = `${projectsDir}/${dirName}`
+
+      // List JSONL files
+      const files = await readdir(dirPath).catch(() => null)
+      if (!files) return
+      const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"))
+      if (jsonlFiles.length === 0) return
+
+      // Find most recent JSONL by mtime
+      const withMtime = await Promise.all(
+        jsonlFiles.map(async (f) => {
+          const s = await stat(`${dirPath}/${f}`).catch(() => null)
+          return { file: f, mtime: s?.mtimeMs ?? 0 }
+        }),
+      )
+      withMtime.sort((a, b) => b.mtime - a.mtime)
+      const latestFile = withMtime[0].file
+
+      // Extract cwd from the most recent session to get the real path
+      const cwd = await extractCwd(`${dirPath}/${latestFile}`)
+      if (!cwd) return
+
+      // Extract prompt from the most recent session
+      const promptInfo = await extractFirstPrompt(`${dirPath}/${latestFile}`)
+
+      // Determine if this is a worktree session
+      const claudeWtMatch = cwd.match(/^(.+)\/.claude\/worktrees\/([^/]+)/)
+      const cursorWtMatch = cwd.match(
+        /^(.+)\/.cursor\/worktrees\/[^/]+\/([^/]+)/,
+      )
+      const wtMatch = claudeWtMatch ?? cursorWtMatch
+
+      entries.push({
+        cwd,
+        isWorktree: !!wtMatch,
+        repoRoot: wtMatch ? wtMatch[1] : cwd,
+        worktreeName: wtMatch ? wtMatch[2] : null,
+        sessionCount: jsonlFiles.length,
+        latestPrompt: promptInfo?.prompt ?? "",
+        latestTimestamp: promptInfo?.timestamp ?? "",
+      })
+    }
+
+    // Process with concurrency limit
+    for (const dirName of dirs) {
+      const task = processDir(dirName)
+      executing.push(task)
+      task.then(() => {
+        const idx = executing.indexOf(task)
+        if (idx !== -1) executing.splice(idx, 1)
+      })
+      if (executing.length >= CONCURRENCY) {
+        await Promise.race(executing)
+      }
+    }
+    await Promise.all(executing)
+
+    // Group by repo root
+    const groups = new Map<string, GlobalRepoGroup>()
+
+    for (const entry of entries) {
+      // Skip the excluded repo
+      if (excludeRepoRoot && entry.repoRoot === excludeRepoRoot) continue
+
+      let group = groups.get(entry.repoRoot)
+      if (!group) {
+        group = { repoRoot: entry.repoRoot, main: null, worktrees: [], totalSessions: 0 }
+        groups.set(entry.repoRoot, group)
+      }
+
+      group.totalSessions += entry.sessionCount
+
+      if (entry.isWorktree) {
+        group.worktrees.push(entry)
+      } else {
+        group.main = entry
+      }
+    }
+
+    // Sort groups by total session count descending
+    const result = Array.from(groups.values())
+    result.sort((a, b) => b.totalSessions - a.totalSessions)
+
+    // Sort worktrees within each group by session count descending
+    for (const group of result) {
+      group.worktrees.sort((a, b) => b.sessionCount - a.sessionCount)
+    }
+
+    return result
+  } catch {
+    return []
+  }
+}
+
+/**
  * Look up Claude Code session info for a worktree by reading
  * `~/.claude/projects/{encoded-path}/` directly.
  *
