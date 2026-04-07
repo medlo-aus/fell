@@ -22,12 +22,15 @@ import {
   fetchPrForBranch,
   fetchWorktreeFileStatus,
   fetchWorktreeFileList,
+  fetchDirectorySize,
+  formatBytes,
   openDirectory,
   checkGhStatus,
   type Worktree,
   type PrStatus,
   type FileStatusResult,
   type FileEntry,
+  type DirSize,
   type GhDiagnostic,
 } from "./lib/git"
 import {
@@ -41,6 +44,7 @@ import {
   shortenPath,
   formatPrStatus,
   formatFileStatus,
+  fellLogo,
   renderHelpLines,
   printCliHelp,
   type Key,
@@ -54,6 +58,7 @@ interface WorktreeItem {
   worktree: Worktree
   prStatus: PrStatus
   fileStatus: FileStatusResult
+  dirSize: DirSize
 }
 
 /** Per-item progress entry for the deleting status line. */
@@ -157,7 +162,23 @@ function renderRow(
   // Pad branch column for alignment
   const branchPadded = pad(branchStr, BRANCH_COL + 2)
 
-  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pr}${tagStr}`
+  // Directory size column
+  let sizeStr: string
+  switch (item.dirSize.type) {
+    case "loading": {
+      const frame = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]
+      sizeStr = c.dim(`${frame} estimating`)
+      break
+    }
+    case "done":
+      sizeStr = c.dim(formatBytes(item.dirSize.bytes))
+      break
+    case "error":
+      sizeStr = ""
+      break
+  }
+
+  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pad(pr, 18)}${sizeStr}${tagStr}`
   const lines = [mainLine]
 
   // Sub-line: dirty file status with warning icon, indented under the branch name
@@ -203,12 +224,11 @@ function render(state: State): void {
 
   // Title bar
   lines.push("")
-  const selectedInfo =
+  const suffix =
     state.selected.size > 0
       ? `  ${c.lime(`${state.selected.size} selected`)}`
-      : `    ${c.dim(c.italic("worktree cli"))}`
-  lines.push(`  ${c.dim("▐▘ █▌ ▐  ▐")}${selectedInfo}`)
-  lines.push(`  ${c.dim("▜▘ ▙▖ ▐▖ ▐▖")}`)
+      : ""
+  lines.push(`  ${c.bold(fellLogo())}  ${c.dim("Interactive Worktree Cleanup")}${suffix}`)
   lines.push("")
 
   // Main worktree (always visible, non-interactive)
@@ -471,6 +491,7 @@ function startDelete(
     await refreshWorktrees(state)
     startPrFetching(state, rerender)
     startFileStatusFetching(state, rerender)
+    startSizeFetching(state, rerender)
 
     if (needsForce) {
       state.mode = {
@@ -503,6 +524,7 @@ async function refreshWorktrees(state: State): Promise<void> {
       worktree: w,
       prStatus: { type: "loading" as const },
       fileStatus: { type: "loading" as const },
+      dirSize: { type: "loading" as const },
     }))
 
   state.selected.clear()
@@ -643,6 +665,35 @@ function startFileStatusFetching(state: State, rerender: () => void): void {
 }
 
 // ---------------------------------------------------------------------------
+// Async directory size fetching (background, sequential)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch directory sizes for all non-main worktrees in background.
+ * Runs sequentially (du is I/O heavy, parallel would thrash disk).
+ */
+function startSizeFetching(state: State, rerender: () => void): void {
+  ;(async () => {
+    for (let i = 0; i < state.items.length; i++) {
+      const item = state.items[i]
+      const path = item.worktree.path
+      try {
+        const result = await fetchDirectorySize(path)
+        // Guard against stale index
+        if (state.items[i]?.worktree.path === path) {
+          state.items[i].dirSize = result
+        }
+      } catch {
+        if (state.items[i]?.worktree.path === path) {
+          state.items[i].dirSize = { type: "error" }
+        }
+      }
+      rerender()
+    }
+  })()
+}
+
+// ---------------------------------------------------------------------------
 // Key handling
 // ---------------------------------------------------------------------------
 
@@ -742,6 +793,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     await refreshWorktrees(state)
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
+    startSizeFetching(state, () => render(state))
     state.message = { text: "Refreshed.", kind: "success" }
     return
   }
@@ -848,6 +900,7 @@ async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
       await refreshWorktrees(state)
       startPrFetching(state, () => render(state))
       startFileStatusFetching(state, () => render(state))
+      startSizeFetching(state, () => render(state))
       state.mode = {
         type: "result",
         lines: [`${c.green("\u2713")} Stale references pruned.`],
@@ -877,8 +930,7 @@ async function printListAndExit(): Promise<void> {
   const ghDiagnostic = await checkGhStatus()
 
   console.log()
-  console.log(`  ${c.dim("▐▘ █▌ ▐  ▐")}  ${c.dim("--list")}`)
-  console.log(`  ${c.dim("▜▘ ▙▖ ▐▖ ▐▖")}`)
+  console.log(`  ${c.bold(fellLogo())}  ${c.dim("--list")}`)
   console.log()
 
   // Fetch file statuses for all worktrees concurrently
@@ -972,7 +1024,9 @@ function startSpinnerTimer(
 ): ReturnType<typeof setInterval> {
   return setInterval(() => {
     // Animate when there are loading statuses or an active delete in progress
-    const hasLoading = state.items.some((i) => i.prStatus.type === "loading")
+    const hasLoading = state.items.some(
+      (i) => i.prStatus.type === "loading" || i.dirSize.type === "loading",
+    )
     const isDeleting = state.mode.type === "deleting"
     if (hasLoading || isDeleting) {
       state.spinnerFrame =
@@ -1030,6 +1084,7 @@ async function main() {
       worktree: w,
       prStatus: { type: "loading" },
       fileStatus: { type: "loading" },
+      dirSize: { type: "loading" },
     })),
     mainWorktree,
     cursor: 0,
@@ -1079,9 +1134,10 @@ async function main() {
     // Initial render
     render(state)
 
-    // Start background PR fetching + file status checks
+    // Start background PR fetching, file status checks, and size estimation
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
+    startSizeFetching(state, () => render(state))
 
     // Start spinner animation timer
     const spinnerTimer = startSpinnerTimer(state, () => render(state))

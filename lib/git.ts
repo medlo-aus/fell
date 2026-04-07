@@ -238,6 +238,45 @@ export async function fetchWorktreeFileStatus(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Directory size
+// ---------------------------------------------------------------------------
+
+export type DirSize =
+  | { type: "loading" }
+  | { type: "done"; bytes: number }
+  | { type: "error" }
+
+/**
+ * Get the total size of a directory using `du -sk`.
+ * Returns size in bytes. Uses -sk (kilobytes, no follow symlinks)
+ * to keep it fast -- avoids traversing linked node_modules twice.
+ */
+export async function fetchDirectorySize(
+  dirPath: string,
+): Promise<DirSize> {
+  const result = await $`du -sk ${dirPath}`.nothrow().quiet()
+  if (result.exitCode !== 0) return { type: "error" }
+
+  const kb = parseInt(result.stdout.toString().split("\t")[0], 10)
+  if (isNaN(kb)) return { type: "error" }
+
+  return { type: "done", bytes: kb * 1024 }
+}
+
+/** Format bytes into a human-readable string (e.g. "9.4 GB", "29 MB"). */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`
+  if (bytes < 1024 * 1024 * 1024)
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`
+}
+
+// ---------------------------------------------------------------------------
+// File list (per-worktree)
+// ---------------------------------------------------------------------------
+
 /** A single file entry from git status with its change type. */
 export interface FileEntry {
   path: string

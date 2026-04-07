@@ -29,6 +29,34 @@ export const c = {
   lime: (s: string) => `${CSI}38;5;154m${s}${CSI}0m`,
 } as const
 
+/**
+ * Apply a linear gradient across a string using 256-colour ANSI.
+ * Each character gets an interpolated colour between the start and end RGB values.
+ */
+export function gradient(
+  s: string,
+  from: [number, number, number],
+  to: [number, number, number],
+): string {
+  const len = s.length
+  if (len === 0) return s
+  return s
+    .split("")
+    .map((ch, i) => {
+      const t = len === 1 ? 0 : i / (len - 1)
+      const r = Math.round(from[0] + (to[0] - from[0]) * t)
+      const g = Math.round(from[1] + (to[1] - from[1]) * t)
+      const b = Math.round(from[2] + (to[2] - from[2]) * t)
+      return `${CSI}38;2;${r};${g};${b}m${ch}`
+    })
+    .join("") + `${CSI}0m`
+}
+
+/** Pre-built gradient for the "fell" brand text. Cyan -> lime. */
+export function fellLogo(): string {
+  return gradient("fell", [80, 200, 255], [160, 230, 80])
+}
+
 export const SPINNER_FRAMES = [
   "\u28CB", "\u28D9", "\u28F9", "\u28F8", "\u28FC", "\u28F4",
   "\u28E6", "\u28E7", "\u28C7", "\u28CF",
@@ -251,8 +279,7 @@ export function renderHelpLines(): string[] {
 
 export function printCliHelp(): void {
   console.log()
-  console.log(`  ${c.dim("▐▘ █▌ ▐  ▐")}  ${c.dim("Interactive git worktree manager")}`)
-  console.log(`  ${c.dim("▜▘ ▙▖ ▐▖ ▐▖")}`)
+  console.log(`  ${c.bold(fellLogo())}  ${c.dim("Interactive Worktree Cleanup")}`)
   console.log()
   console.log(c.yellow("  USAGE"))
   console.log()
