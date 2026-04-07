@@ -838,7 +838,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
   }
 
   // Quit
-  if (key === "ctrl-c" || ch === "q") {
+  if (key === "ctrl-c" || key === "escape" || ch === "q") {
     state.shouldQuit = true
     return
   }
@@ -1171,7 +1171,7 @@ async function main() {
 
         case "deleting":
           // Background delete in progress - ignore keys (spinner keeps animating via timer)
-          if (key === "ctrl-c") {
+          if (key === "ctrl-c" || key === "escape" || keyChar(key) === "q") {
             state.shouldQuit = true
           }
           break
@@ -1201,6 +1201,10 @@ async function main() {
     clearInterval(spinnerTimer)
   } finally {
     cleanup()
+    // Force exit immediately. Background async tasks (PR fetching, size
+    // estimation) hold the event loop open. They're non-critical UI state
+    // -- no data corruption risk from terminating mid-flight.
+    process.exit(0)
   }
 }
 
