@@ -206,10 +206,9 @@ function render(state: State): void {
   const selectedInfo =
     state.selected.size > 0
       ? `  ${c.lime(`${state.selected.size} selected`)}`
-      : ""
-  lines.push(`  ${c.dim(".'  _.-----")}${c.bold("| ")}${c.dim(" |")}`)
-  lines.push(`  ${c.dim("|   _|  -__|")}${c.bold("  ")}${c.dim("|  |")}${selectedInfo}`)
-  lines.push(`  ${c.dim("|__| |_____|")}${c.bold("__")}${c.dim("|__|")}`)
+      : `    ${c.dim(c.italic("worktree cli"))}`
+  lines.push(`  ${c.dim("▐▘ █▌ ▐  ▐")}${selectedInfo}`)
+  lines.push(`  ${c.dim("▜▘ ▙▖ ▐▖ ▐▖")}`)
   lines.push("")
 
   // Main worktree (always visible, non-interactive)
@@ -878,9 +877,9 @@ async function printListAndExit(): Promise<void> {
   const ghDiagnostic = await checkGhStatus()
 
   console.log()
-  console.log(`  ${c.dim(".'  _.-----")}${c.bold("| ")}${c.dim(" |")}`)
-  console.log(`  ${c.dim("|   _|  -__|")}${c.bold("  ")}${c.dim("|  |")}  ${c.dim("--list")}`)
-  console.log(`  ${c.dim("|__| |_____|")}${c.bold("__")}${c.dim("|__|")}`)
+  console.log(`  ${c.dim("▐▘ ▜  ▜  ▜")}`)
+  console.log(`  ${c.dim("▜▘ █▌ ▐  ▐")}  ${c.dim("--list")}`)
+  console.log(`  ${c.dim("▐  ▙▖ ▐▖ ▐▖")}`)
   console.log()
 
   // Fetch file statuses for all worktrees concurrently

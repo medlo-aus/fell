@@ -1,7 +1,7 @@
 ```
-   .'  _.-----|  |  |
-   |   _|  -__|  |  |
-   |__| |_____|__|__|
+  ▐▘ ▜  ▜  ▜
+  ▜▘ █▌ ▐  ▐
+  ▐  ▙▖ ▐▖ ▐▖
 ```
 
 Interactive git worktree manager. Navigate worktrees with arrow keys, view PR statuses, delete worktrees + branches, and prune stale references.
