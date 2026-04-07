@@ -27,7 +27,6 @@ import {
   openDirectory,
   checkGhStatus,
   fetchWorktreeSessionInfo,
-  listGlobalClaudeSessions,
   findParentSession,
   type Worktree,
   type PrStatus,
@@ -36,7 +35,6 @@ import {
   type DirSize,
   type GhDiagnostic,
   type SessionResult,
-  type GlobalRepoGroup,
   type ParentSessionResult,
 } from "./lib/git"
 import {
@@ -52,8 +50,6 @@ import {
   formatFileStatus,
   formatSessionInfo,
   formatParentSession,
-  renderGlobalSessionLines,
-  printGlobalSessions,
   fellLogo,
   renderHelpLines,
   printCliHelp,
@@ -103,8 +99,6 @@ interface State {
   expandedIndex: number | null
   /** Cached file list for the expanded item. Null while loading. */
   expandedFiles: FileEntry[] | null
-  /** Global sessions from other repos. Null while loading. */
-  globalSessions: GlobalRepoGroup[] | null
 }
 
 // ---------------------------------------------------------------------------
@@ -297,12 +291,6 @@ function render(state: State): void {
             ? c.green("done")
             : c.cyan("info")
       lines.push(`  ${prefix}  ${state.message.text}`)
-    }
-
-    // Global sessions from other repos (shown in browse mode only)
-    if (state.mode.type === "browse" && state.globalSessions && state.globalSessions.length > 0) {
-      const cols = process.stdout.columns ?? 100
-      lines.push(...renderGlobalSessionLines(state.globalSessions, cols))
     }
 
     // Inline gh CLI warning (progressive disclosure above key hints)
@@ -918,11 +906,6 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     startSessionFetching(state, () => render(state))
     startParentSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
-    // Re-scan global sessions
-    listGlobalClaudeSessions(state.mainWorktree.path).then((groups) => {
-      state.globalSessions = groups
-      render(state)
-    })
     state.message = { text: "Refreshed.", kind: "success" }
     return
   }
@@ -1163,11 +1146,6 @@ async function printListAndExit(): Promise<void> {
     console.log(`    ${c.dim(ghDiagnostic.detail)}`)
   }
 
-  // Global sessions from other repos
-  const mainWorktree = worktrees.find((w) => w.isMain)
-  const globalSessions = await listGlobalClaudeSessions(mainWorktree?.path)
-  printGlobalSessions(globalSessions)
-
   console.log()
 }
 
@@ -1255,7 +1233,6 @@ async function main() {
     ghDiagnostic: { type: "checking" },
     expandedIndex: null,
     expandedFiles: null,
-    globalSessions: null,
   }
 
   // Check gh availability (non-blocking, runs before PR fetching starts)
@@ -1300,12 +1277,6 @@ async function main() {
     startSessionFetching(state, () => render(state))
     startParentSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
-
-    // Global session scan (runs once, excludes current repo)
-    listGlobalClaudeSessions(state.mainWorktree.path).then((groups) => {
-      state.globalSessions = groups
-      render(state)
-    })
 
     // Start spinner animation timer
     const spinnerTimer = startSpinnerTimer(state, () => render(state))
