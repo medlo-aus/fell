@@ -130,6 +130,10 @@ export async function listWorktrees(): Promise<Worktree[]> {
 /**
  * Remove a worktree directory and its git administrative tracking.
  * Use force when the worktree has uncommitted changes.
+ *
+ * Handles zombie worktrees (directory exists but .git file is missing):
+ * falls back to `git worktree prune` to clean the reference, then
+ * removes the leftover directory manually.
  */
 export async function removeWorktree(
   path: string,
@@ -137,10 +141,29 @@ export async function removeWorktree(
 ): Promise<{ ok: boolean; error?: string }> {
   const flags = force ? ["--force"] : []
   const result = await $`git worktree remove ${flags} ${path}`.nothrow().quiet()
-  if (result.exitCode !== 0) {
-    return { ok: false, error: result.stderr.toString().trim() }
+
+  if (result.exitCode === 0) return { ok: true }
+
+  const stderr = result.stderr.toString().trim()
+
+  // Zombie worktree: directory exists but .git is missing.
+  // git worktree remove refuses to act, so we prune the reference
+  // and remove the leftover directory ourselves.
+  const isZombie =
+    stderr.includes("does not exist") &&
+    (stderr.includes(".git") || stderr.includes("validation failed"))
+
+  if (isZombie) {
+    // Prune cleans the stale git reference
+    await $`git worktree prune`.nothrow().quiet()
+
+    // Remove the leftover directory if it still exists
+    await $`rm -rf ${path}`.nothrow().quiet()
+
+    return { ok: true }
   }
-  return { ok: true }
+
+  return { ok: false, error: stderr }
 }
 
 /**
