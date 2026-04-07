@@ -1,0 +1,34 @@
+{
+  "name": "@medlo-aus/fell",
+  "version": "0.1.0",
+  "description": "Interactive git worktree manager. Navigate, inspect, delete, and prune worktrees with async PR status fetching.",
+  "license": "MIT",
+  "bin": {
+    "fell": "cli.ts"
+  },
+  "type": "module",
+  "files": [
+    "cli.ts",
+    "lib/"
+  ],
+  "keywords": [
+    "git",
+    "worktree",
+    "cli",
+    "tui",
+    "interactive",
+    "prune",
+    "bun"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/medlo-aus/fell.git"
+  },
+  "homepage": "https://github.com/medlo-aus/fell",
+  "bugs": {
+    "url": "https://github.com/medlo-aus/fell/issues"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
