@@ -28,6 +28,7 @@ import {
   checkGhStatus,
   fetchWorktreeSessionInfo,
   listGlobalClaudeSessions,
+  findParentSession,
   type Worktree,
   type PrStatus,
   type FileStatusResult,
@@ -36,6 +37,7 @@ import {
   type GhDiagnostic,
   type SessionResult,
   type GlobalRepoGroup,
+  type ParentSessionResult,
 } from "./lib/git"
 import {
   c,
@@ -49,6 +51,7 @@ import {
   formatPrStatus,
   formatFileStatus,
   formatSessionInfo,
+  formatParentSession,
   renderGlobalSessionLines,
   printGlobalSessions,
   fellLogo,
@@ -67,6 +70,7 @@ interface WorktreeItem {
   fileStatus: FileStatusResult
   dirSize: DirSize
   sessionInfo: SessionResult
+  parentSession: ParentSessionResult
 }
 
 /** Per-item progress entry for the deleting status line. */
@@ -203,6 +207,12 @@ function renderRow(
   const sessionLine = formatSessionInfo(item.sessionInfo, cols - 30)
   if (sessionLine) {
     lines.push(`        ${sessionLine}`)
+  }
+
+  // Sub-line: parent session (which active Claude session created this worktree)
+  const parentLine = formatParentSession(item.parentSession, cols - 20)
+  if (parentLine) {
+    lines.push(`        ${parentLine}`)
   }
 
   // Expanded file list (progressive disclosure via "e" key)
@@ -515,6 +525,7 @@ function startDelete(
     startPrFetching(state, rerender)
     startFileStatusFetching(state, rerender)
     startSessionFetching(state, rerender)
+    startParentSessionFetching(state, rerender)
     startSizeFetching(state, rerender)
 
     if (needsForce) {
@@ -550,6 +561,7 @@ async function refreshWorktrees(state: State): Promise<void> {
       fileStatus: { type: "loading" as const },
       dirSize: { type: "loading" as const },
       sessionInfo: { type: "loading" as const },
+      parentSession: { type: "loading" as const },
     }))
 
   state.selected.clear()
@@ -739,6 +751,42 @@ function startSessionFetching(state: State, rerender: () => void): void {
 }
 
 // ---------------------------------------------------------------------------
+// Async parent session detection (background)
+// ---------------------------------------------------------------------------
+
+/**
+ * For each worktree, find the active Claude Code session that created it.
+ * Runs findParentSession() for each worktree concurrently.
+ * Since this involves grepping JSONL files it's the slowest fetch --
+ * runs after the faster fetches have already populated the UI.
+ */
+function startParentSessionFetching(state: State, rerender: () => void): void {
+  const entries = state.items.map((item, index) => ({
+    path: item.worktree.path,
+    index,
+  }))
+
+  // Run all concurrently -- findParentSession already limits grep parallelism internally
+  ;(async () => {
+    await Promise.all(
+      entries.map(async ({ path, index }) => {
+        try {
+          const result = await findParentSession(path)
+          if (state.items[index]?.worktree.path === path) {
+            state.items[index].parentSession = result
+          }
+        } catch {
+          if (state.items[index]?.worktree.path === path) {
+            state.items[index].parentSession = { type: "none" }
+          }
+        }
+        rerender()
+      }),
+    )
+  })()
+}
+
+// ---------------------------------------------------------------------------
 // Async directory size fetching (background, sequential)
 // ---------------------------------------------------------------------------
 
@@ -868,6 +916,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
     startSessionFetching(state, () => render(state))
+    startParentSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
     // Re-scan global sessions
     listGlobalClaudeSessions(state.mainWorktree.path).then((groups) => {
@@ -981,6 +1030,7 @@ async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
       startPrFetching(state, () => render(state))
       startFileStatusFetching(state, () => render(state))
       startSessionFetching(state, () => render(state))
+      startParentSessionFetching(state, () => render(state))
       startSizeFetching(state, () => render(state))
       state.mode = {
         type: "result",
@@ -1014,8 +1064,8 @@ async function printListAndExit(): Promise<void> {
   console.log(`  ${c.bold(fellLogo())}  ${c.dim("--list")}`)
   console.log()
 
-  // Fetch file statuses and session info for all worktrees concurrently
-  const [fileStatuses, sessionInfos] = await Promise.all([
+  // Fetch file statuses, session info, and parent sessions concurrently
+  const [fileStatuses, sessionInfos, parentSessions] = await Promise.all([
     Promise.all(
       worktrees.map(async (wt) => {
         if (wt.isBare) return { type: "clean" as const }
@@ -1024,6 +1074,9 @@ async function printListAndExit(): Promise<void> {
     ),
     Promise.all(
       worktrees.map(async (wt) => fetchWorktreeSessionInfo(wt.path)),
+    ),
+    Promise.all(
+      worktrees.map(async (wt) => findParentSession(wt.path)),
     ),
   ])
 
@@ -1056,6 +1109,12 @@ async function printListAndExit(): Promise<void> {
     const sessLine = formatSessionInfo(sessionInfos[i], cols - 20)
     if (sessLine) {
       console.log(`     ${sessLine}`)
+    }
+
+    // Sub-line for parent session (which active Claude session spawned this worktree)
+    const parentLine = formatParentSession(parentSessions[i], cols - 20)
+    if (parentLine) {
+      console.log(`     ${parentLine}`)
     }
   }
 
@@ -1184,6 +1243,7 @@ async function main() {
       fileStatus: { type: "loading" },
       dirSize: { type: "loading" },
       sessionInfo: { type: "loading" },
+      parentSession: { type: "loading" },
     })),
     mainWorktree,
     cursor: 0,
@@ -1234,10 +1294,11 @@ async function main() {
     // Initial render
     render(state)
 
-    // Start background PR fetching, file status, sessions, and size estimation
+    // Start background fetching: PR, file status, sessions, parent sessions, size
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
     startSessionFetching(state, () => render(state))
+    startParentSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
 
     // Global session scan (runs once, excludes current repo)

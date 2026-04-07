@@ -753,3 +753,175 @@ export async function fetchWorktreeSessionInfo(
     return { type: "none" }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Parent session association (worktree <-> spawning session)
+// ---------------------------------------------------------------------------
+
+/*
+ * FLOW DIAGRAM: How we match a worktree to the Claude Code session that created it
+ *
+ *   ~/.claude/sessions/
+ *   ├── 15746.json  ─────────┐
+ *   ├── 51087.json            │  Step 1: List active session PIDs
+ *   └── 71924.json            │          Read each JSON for { sessionId, cwd }
+ *                             │
+ *                             ▼
+ *   ┌─────────────────────────────────────────┐
+ *   │  Active Session Registry                │
+ *   │                                         │
+ *   │  PID 15746                              │
+ *   │    sessionId: 4491a274-...              │
+ *   │    cwd: /Users/x/code/medlo             │
+ *   │                                         │
+ *   │  PID 51087                              │
+ *   │    sessionId: e3408292-...              │
+ *   │    cwd: /Users/x/code/medlo/            │
+ *   │         .claude/worktrees/evo           │
+ *   └──────────────┬──────────────────────────┘
+ *                  │
+ *                  │  Step 2: For each session, locate its JSONL transcript
+ *                  │          at ~/.claude/projects/{encode(cwd)}/{sessionId}.jsonl
+ *                  ▼
+ *   ~/.claude/projects/-Users-x-code-medlo/
+ *   └── 4491a274-....jsonl  ◄── Full conversation transcript (JSONL)
+ *                  │
+ *                  │  Step 3: grep the JSONL for each worktree path
+ *                  │          e.g. ".worktrees/session-column"
+ *                  │          (matches Bash tool calls like
+ *                  │           `git worktree add .worktrees/session-column`)
+ *                  ▼
+ *   ┌─────────────────────────────────────────┐
+ *   │  MATCH FOUND                            │
+ *   │                                         │
+ *   │  Session 4491a274 (cwd: ~/code/medlo)   │
+ *   │  contains ".worktrees/session-column"   │
+ *   │  in its transcript                      │
+ *   │                                         │
+ *   │  → This session CREATED the worktree    │
+ *   └─────────────────────────────────────────┘
+ *
+ * WHY only active sessions:
+ *   - ~/.claude/sessions/ only contains PIDs of RUNNING Claude Code processes
+ *   - Completed sessions are removed from this registry
+ *   - Scanning all historical sessions (121+ files, 185MB+) would be too slow
+ *   - Active sessions are the most useful: "who is working in this worktree right now?"
+ *
+ * WHY grep instead of JSON parsing:
+ *   - JSONL files can be 5MB+ per session (this conversation alone is ~5.5MB)
+ *   - grep -l short-circuits on first match (doesn't read the whole file)
+ *   - We only need to know IF the path appears, not WHERE or HOW
+ *   - Bun's $ shell handles the subprocess efficiently
+ *
+ * PERFORMANCE:
+ *   - Typically 5-15 active sessions
+ *   - Each grep -l takes ~50-400ms depending on file size
+ *   - Total: <2s for all active sessions, runs in background
+ *   - Falls back gracefully if ~/.claude doesn't exist
+ */
+
+/** A Claude Code session that spawned or references a worktree. */
+export interface ParentSession {
+  /** The session UUID. */
+  sessionId: string
+  /** The working directory of the session (typically the main repo, not the worktree). */
+  cwd: string
+  /** First user prompt from the session, for identification. */
+  prompt: string
+}
+
+export type ParentSessionResult =
+  | { type: "loading" }
+  | { type: "found"; session: ParentSession }
+  | { type: "none" }
+
+/**
+ * Find the active Claude Code session that created or references a worktree.
+ *
+ * Scans `~/.claude/sessions/*.json` for running sessions, then greps each
+ * session's JSONL transcript for the worktree path. Returns the first match.
+ *
+ * @param worktreePath - Absolute path to the worktree directory
+ * @returns The parent session if found, or `{ type: "none" }` if no active
+ *          session references this worktree. Never throws.
+ */
+export async function findParentSession(
+  worktreePath: string,
+): Promise<ParentSessionResult> {
+  const home = process.env.HOME
+  if (!home) return { type: "none" }
+
+  const sessionsDir = `${home}/.claude/sessions`
+  const projectsDir = `${home}/.claude/projects`
+
+  // Extract just the worktree-specific suffix for grep matching.
+  // e.g. "/Users/x/code/fell/.worktrees/session-column" -> ".worktrees/session-column"
+  // This is more robust than grepping the full absolute path, which may appear
+  // in different forms (with/without trailing slash, relative, etc.)
+  const wtSuffix = worktreePath.match(/\.worktrees\/[^/]+$/)?.[0]
+    ?? worktreePath.match(/\.claude\/worktrees\/[^/]+$/)?.[0]
+  if (!wtSuffix) return { type: "none" }
+
+  try {
+    const { readdir } = await import("node:fs/promises")
+    const sessionFiles = await readdir(sessionsDir).catch(() => null)
+    if (!sessionFiles) return { type: "none" }
+
+    // Step 1: Read all active session metadata
+    const activeSessions: Array<{
+      sessionId: string
+      cwd: string
+      jsonlPath: string
+    }> = []
+
+    for (const file of sessionFiles) {
+      if (!file.endsWith(".json")) continue
+      try {
+        const raw = await Bun.file(`${sessionsDir}/${file}`).json()
+        const sid = raw?.sessionId as string | undefined
+        const cwd = raw?.cwd as string | undefined
+        if (!sid || !cwd) continue
+
+        const encoded = encodeClaudeProjectPath(cwd)
+        const jsonlPath = `${projectsDir}/${encoded}/${sid}.jsonl`
+
+        // Only include if the JSONL file exists
+        if (await Bun.file(jsonlPath).exists()) {
+          activeSessions.push({ sessionId: sid, cwd, jsonlPath })
+        }
+      } catch {
+        /* skip unreadable session files */
+      }
+    }
+
+    if (activeSessions.length === 0) return { type: "none" }
+
+    // Step 2: grep each session's JSONL for the worktree path.
+    // Run concurrently -- each grep -l short-circuits on first match.
+    const grepResults = await Promise.all(
+      activeSessions.map(async (session) => {
+        const result = await $`grep -l ${wtSuffix} ${session.jsonlPath}`
+          .nothrow()
+          .quiet()
+        return { session, matched: result.exitCode === 0 }
+      }),
+    )
+
+    const match = grepResults.find((r) => r.matched)
+    if (!match) return { type: "none" }
+
+    // Step 3: Extract the first user prompt from the matched session for display
+    const promptInfo = await extractFirstPrompt(match.session.jsonlPath)
+
+    return {
+      type: "found",
+      session: {
+        sessionId: match.session.sessionId,
+        cwd: match.session.cwd,
+        prompt: promptInfo?.prompt ?? "",
+      },
+    }
+  } catch {
+    return { type: "none" }
+  }
+}

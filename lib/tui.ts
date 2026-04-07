@@ -4,7 +4,7 @@
  * and the help screen content.
  */
 
-import type { PrStatus, FileStatusResult, SessionResult, GlobalRepoGroup } from "./git"
+import type { PrStatus, FileStatusResult, SessionResult, GlobalRepoGroup, ParentSessionResult } from "./git"
 
 // ---------------------------------------------------------------------------
 // ANSI escape helpers
@@ -261,6 +261,39 @@ export function formatSessionInfo(
 
   const prompt = truncate(latestPrompt, maxPromptWidth)
   return `${c.dim("\u25C8")} ${count} ${c.dim("\u00B7")} ${c.dim(c.italic(`"${prompt}"`))}`
+}
+
+// ---------------------------------------------------------------------------
+// Parent session formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a parent session sub-line for a worktree.
+ * Shows which active Claude Code session created this worktree.
+ * Returns null if no parent session or still loading.
+ */
+export function formatParentSession(
+  result: ParentSessionResult,
+  maxWidth: number,
+): string | null {
+  if (result.type !== "found") return null
+
+  const { cwd, prompt } = result.session
+
+  const home = process.env.HOME ?? ""
+  let cwdDisplay = cwd
+  if (home && cwdDisplay.startsWith(home)) {
+    cwdDisplay = "~" + cwdDisplay.slice(home.length)
+  }
+
+  const parts = [c.cyan("\u2190"), c.dim(truncate(cwdDisplay, 30))]
+
+  if (prompt) {
+    parts.push(c.dim("\u00B7"))
+    parts.push(c.dim(c.italic(`"${truncate(prompt, maxWidth - 40)}"`)))
+  }
+
+  return parts.join(" ")
 }
 
 // ---------------------------------------------------------------------------
