@@ -4,7 +4,7 @@
  * and the help screen content.
  */
 
-import type { PrStatus, FileStatusResult } from "./git"
+import type { PrStatus, FileStatusResult, SessionResult, GlobalRepoGroup, ParentSessionResult } from "./git"
 
 // ---------------------------------------------------------------------------
 // ANSI escape helpers
@@ -235,6 +235,181 @@ export function formatFileStatus(result: FileStatusResult): string | null {
   if (parts.length === 0) return null
 
   return `${c.yellow("\u26A0")} ${parts.join(c.dim("  \u00B7  "))}`
+}
+
+// ---------------------------------------------------------------------------
+// Session info formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a Claude Code session sub-line for a worktree.
+ * Returns null if no sessions or still loading.
+ */
+export function formatSessionInfo(
+  result: SessionResult,
+  maxPromptWidth: number,
+): string | null {
+  if (result.type !== "found") return null
+
+  const { sessionCount, latestPrompt } = result.info
+  const s = sessionCount === 1 ? "session" : "sessions"
+  const count = c.dim(`${sessionCount} ${s}`)
+
+  if (!latestPrompt) {
+    return `${c.dim("\u25C8")} ${count}`
+  }
+
+  const prompt = truncate(latestPrompt, maxPromptWidth)
+  return `${c.dim("\u25C8")} ${count} ${c.dim("\u00B7")} ${c.dim(c.italic(`"${prompt}"`))}`
+}
+
+// ---------------------------------------------------------------------------
+// Parent session formatting
+// ---------------------------------------------------------------------------
+
+/** Orange 256-colour code for Claude/session indicators. */
+const orange = (s: string) => `\x1b[38;5;208m${s}\x1b[0m`
+
+/**
+ * Render an inline orange dot indicator for worktrees with an active parent session.
+ * Shown on the main row (not a sub-line). Returns empty string if no parent session.
+ */
+export function formatParentSessionInline(result: ParentSessionResult): string {
+  if (result.type !== "found") return ""
+  return orange("\u25CF") + " " + c.dim("session")
+}
+
+/**
+ * Render expanded parent session detail lines (shown when user presses "e").
+ * Includes the parent session's CWD and prompt summary.
+ */
+export function formatParentSessionExpanded(
+  result: ParentSessionResult,
+  maxWidth: number,
+): string[] {
+  if (result.type !== "found") return []
+
+  const { cwd, prompt } = result.session
+  const home = process.env.HOME ?? ""
+  let cwdDisplay = cwd
+  if (home && cwdDisplay.startsWith(home)) {
+    cwdDisplay = "~" + cwdDisplay.slice(home.length)
+  }
+
+  const lines: string[] = []
+  const label = `${orange("\u25CF")} ${c.dim("session")} ${c.dim("\u00B7")} ${c.dim(truncate(cwdDisplay, 35))}`
+
+  if (prompt) {
+    lines.push(`${label} ${c.dim("\u00B7")} ${c.dim(c.italic(`"${truncate(prompt, maxWidth - 50)}"`))}`)
+  } else {
+    lines.push(label)
+  }
+
+  return lines
+}
+
+// ---------------------------------------------------------------------------
+// Global session rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * Render the "other repos" global session section for the TUI.
+ * Shows a compact summary of sessions grouped by repo.
+ */
+export function renderGlobalSessionLines(
+  groups: GlobalRepoGroup[],
+  maxWidth: number,
+): string[] {
+  if (groups.length === 0) return []
+
+  const totalRepos = groups.length
+  const totalWorktrees = groups.reduce((sum, g) => sum + g.worktrees.length, 0)
+  const totalSessions = groups.reduce((sum, g) => sum + g.totalSessions, 0)
+
+  const lines: string[] = []
+  lines.push("")
+  lines.push(
+    `  ${c.dim(`${totalRepos} other repo${totalRepos === 1 ? "" : "s"}`)} ${c.dim("\u00B7")} ${c.dim(`${totalWorktrees} worktree${totalWorktrees === 1 ? "" : "s"}`)} ${c.dim("\u00B7")} ${c.dim(`${totalSessions} session${totalSessions === 1 ? "" : "s"}`)}`,
+  )
+
+  for (const group of groups) {
+    const home = process.env.HOME ?? ""
+    let repoDisplay = group.repoRoot
+    if (home && repoDisplay.startsWith(home)) {
+      repoDisplay = "~" + repoDisplay.slice(home.length)
+    }
+
+    const wtCount = group.worktrees.length
+    const sessCount = group.totalSessions
+
+    lines.push(
+      `    ${c.dim(truncate(repoDisplay, maxWidth - 30))}  ${c.dim(`${wtCount} wt`)} ${c.dim("\u00B7")} ${c.dim(`${sessCount} sess`)}`,
+    )
+
+    // Show worktrees with their latest prompt (compact)
+    for (const wt of group.worktrees.slice(0, 3)) {
+      const name = wt.worktreeName ?? "main"
+      const prompt = wt.latestPrompt
+        ? ` ${c.dim("\u00B7")} ${c.dim(c.italic(`"${truncate(wt.latestPrompt, maxWidth - 40)}"`))}`
+        : ""
+      lines.push(
+        `      ${c.dim("\u25C8")} ${c.dim(name)}${prompt}`,
+      )
+    }
+    if (group.worktrees.length > 3) {
+      lines.push(`      ${c.dim(`... ${group.worktrees.length - 3} more`)}`)
+    }
+  }
+
+  return lines
+}
+
+/**
+ * Render global sessions for --list mode (more expanded than TUI).
+ */
+export function printGlobalSessions(groups: GlobalRepoGroup[]): void {
+  if (groups.length === 0) return
+
+  console.log()
+  console.log(`  ${c.dim("OTHER REPOS")}`)
+  console.log()
+
+  for (const group of groups) {
+    const home = process.env.HOME ?? ""
+    let repoDisplay = group.repoRoot
+    if (home && repoDisplay.startsWith(home)) {
+      repoDisplay = "~" + repoDisplay.slice(home.length)
+    }
+
+    const parts: string[] = []
+    if (group.worktrees.length > 0) {
+      parts.push(`${group.worktrees.length} worktree${group.worktrees.length === 1 ? "" : "s"}`)
+    }
+    parts.push(`${group.totalSessions} session${group.totalSessions === 1 ? "" : "s"}`)
+
+    console.log(`  ${c.dim(repoDisplay)}  ${c.dim(`(${parts.join(", ")})`)}`)
+
+    // Main repo sessions
+    if (group.main && group.main.sessionCount > 0) {
+      const prompt = group.main.latestPrompt
+        ? `  ${c.dim(c.italic(`"${truncate(group.main.latestPrompt, 60)}"`))}`
+        : ""
+      console.log(
+        `    ${c.dim("\u25C8")} ${c.dim("main")} ${c.dim("\u00B7")} ${c.dim(`${group.main.sessionCount} session${group.main.sessionCount === 1 ? "" : "s"}`)}${prompt}`,
+      )
+    }
+
+    // Worktree sessions
+    for (const wt of group.worktrees) {
+      const name = wt.worktreeName ?? "unknown"
+      const prompt = wt.latestPrompt
+        ? `  ${c.dim(c.italic(`"${truncate(wt.latestPrompt, 60)}"`))}`
+        : ""
+      console.log(
+        `    ${c.dim("\u25C8")} ${c.dim(name)} ${c.dim("\u00B7")} ${c.dim(`${wt.sessionCount} session${wt.sessionCount === 1 ? "" : "s"}`)}${prompt}`,
+      )
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -26,12 +26,16 @@ import {
   formatBytes,
   openDirectory,
   checkGhStatus,
+  fetchWorktreeSessionInfo,
+  findParentSession,
   type Worktree,
   type PrStatus,
   type FileStatusResult,
   type FileEntry,
   type DirSize,
   type GhDiagnostic,
+  type SessionResult,
+  type ParentSessionResult,
 } from "./lib/git"
 import {
   c,
@@ -44,6 +48,9 @@ import {
   shortenPath,
   formatPrStatus,
   formatFileStatus,
+  formatSessionInfo,
+  formatParentSessionInline,
+  formatParentSessionExpanded,
   fellLogo,
   renderHelpLines,
   printCliHelp,
@@ -54,18 +61,23 @@ import {
 // State
 // ---------------------------------------------------------------------------
 
+/** In-flight deletion status for an item. Null when not being deleted. */
+type ItemDeleteStatus =
+  | { phase: "removing" }
+  | { phase: "branch" }
+  | { phase: "done"; message: string }
+  | { phase: "error"; message: string }
+  | { phase: "needs-force" }
+
 interface WorktreeItem {
   worktree: Worktree
   prStatus: PrStatus
   fileStatus: FileStatusResult
   dirSize: DirSize
-}
-
-/** Per-item progress entry for the deleting status line. */
-interface DeleteProgress {
-  label: string
-  status: "pending" | "removing" | "branch" | "done" | "error" | "needs-force"
-  message?: string
+  sessionInfo: SessionResult
+  parentSession: ParentSessionResult
+  /** Set during deletion. Null when the item is not being deleted. */
+  deleteStatus: ItemDeleteStatus | null
 }
 
 type Mode =
@@ -73,7 +85,6 @@ type Mode =
   | { type: "confirm-delete"; indices: number[] }
   | { type: "confirm-force"; indices: number[]; withBranch: boolean }
   | { type: "confirm-prune"; candidates: string[] }
-  | { type: "deleting"; progress: DeleteProgress[]; withBranch: boolean }
   | { type: "result"; lines: string[] }
   | { type: "help" }
 
@@ -138,9 +149,43 @@ function renderRow(
   index: number,
   state: State,
 ): string[] {
+  const wt = item.worktree
+
+  // Items being deleted render as a dimmed single line with progress icon
+  if (item.deleteStatus) {
+    const branchRaw = wt.branch ?? "(detached)"
+    const branchStr = c.dim(truncate(branchRaw, BRANCH_COL))
+    const frame = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]
+
+    let icon: string
+    let detail = ""
+    switch (item.deleteStatus.phase) {
+      case "removing":
+        icon = c.cyan(frame)
+        detail = c.dim(" removing")
+        break
+      case "branch":
+        icon = c.cyan(frame)
+        detail = c.dim(" deleting branch")
+        break
+      case "done":
+        icon = c.green("\u2713")
+        detail = `  ${c.dim(item.deleteStatus.message)}`
+        break
+      case "error":
+        icon = c.red("\u2717")
+        detail = `  ${c.dim(item.deleteStatus.message)}`
+        break
+      case "needs-force":
+        icon = c.yellow("!")
+        detail = c.dim(" has uncommitted changes")
+        break
+    }
+    return [`    ${icon} ${branchStr}${detail}`]
+  }
+
   const isFocused = index === state.cursor
   const isSelected = state.selected.has(index)
-  const wt = item.worktree
 
   const cursor = isFocused ? c.cyan("\u276F") : " "
   const check = isSelected ? c.lime("\u25CF") : c.dim("\u25CB")
@@ -178,7 +223,11 @@ function renderRow(
       break
   }
 
-  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pad(pr, 18)}${sizeStr}${tagStr}`
+  // Inline parent session indicator (orange dot on the main row)
+  const parentInline = formatParentSessionInline(item.parentSession)
+  const parentSuffix = parentInline ? `  ${parentInline}` : ""
+
+  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pad(pr, 18)}${sizeStr}${tagStr}${parentSuffix}`
   const lines = [mainLine]
 
   // Sub-line: dirty file status with warning icon, indented under the branch name
@@ -188,9 +237,23 @@ function renderRow(
     lines.push(`        ${fileStatusLine}`)
   }
 
-  // Expanded file list (progressive disclosure via "e" key)
+  // Expanded detail (progressive disclosure via "e" key)
   const MAX_EXPANDED_FILES = 12
+  const cols = process.stdout.columns ?? 100
   if (state.expandedIndex === index) {
+    // Session info (only in expanded view)
+    const sessionLine = formatSessionInfo(item.sessionInfo, cols - 30)
+    if (sessionLine) {
+      lines.push(`        ${sessionLine}`)
+    }
+
+    // Parent session detail (only in expanded view)
+    const parentLines = formatParentSessionExpanded(item.parentSession, cols - 20)
+    for (const pl of parentLines) {
+      lines.push(`        ${pl}`)
+    }
+
+    // File list
     if (state.expandedFiles === null) {
       const frame = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]
       lines.push(`        ${c.dim(`${frame} loading files...`)}`)
@@ -331,49 +394,6 @@ function render(state: State): void {
         )
         break
       }
-      case "deleting": {
-        const { progress } = state.mode
-        const done = progress.filter((p) => p.status === "done").length
-        const total = progress.length
-        const frame = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]
-
-        for (const entry of progress) {
-          let icon: string
-          let detail = ""
-          switch (entry.status) {
-            case "pending":
-              icon = c.dim("\u25CB")
-              break
-            case "removing":
-              icon = c.cyan(frame)
-              detail = c.dim(" removing worktree")
-              break
-            case "branch":
-              icon = c.cyan(frame)
-              detail = c.dim(" deleting branch")
-              break
-            case "done":
-              icon = c.green("\u2713")
-              detail = entry.message ? `  ${c.dim(entry.message)}` : ""
-              break
-            case "error":
-              icon = c.red("\u2717")
-              detail = entry.message ? `  ${c.dim(entry.message)}` : ""
-              break
-            case "needs-force":
-              icon = c.yellow("!")
-              detail = c.dim(" has uncommitted changes")
-              break
-          }
-          lines.push(`    ${icon} ${entry.label}${detail}`)
-        }
-
-        lines.push("")
-        lines.push(
-          `  ${c.cyan(frame)} Deleting ${done}/${total}...`,
-        )
-        break
-      }
       case "result": {
         for (const line of state.mode.lines) {
           lines.push(`  ${line}`)
@@ -405,6 +425,12 @@ function render(state: State): void {
  * and re-rendering after each step), then transitions to "result" mode.
  * The event loop stays responsive for spinner animation during this time.
  */
+/**
+ * Run delete operations inline within the worktree list.
+ * Stays in browse mode -- each item shows its deletion progress directly
+ * in its row. Completed items are removed from the list after a brief
+ * delay so the user sees the success indicator before it disappears.
+ */
 function startDelete(
   state: State,
   indices: number[],
@@ -412,34 +438,26 @@ function startDelete(
   force: boolean,
   rerender: () => void,
 ): void {
-  // Build progress entries
-  const progress: DeleteProgress[] = indices.map((idx) => {
-    const item = state.items[idx]
-    return {
-      label: item?.worktree.branch ?? item?.worktree.path ?? `index ${idx}`,
-      status: "pending" as const,
+  // Mark items as deleting. Stay in browse mode so the list stays visible.
+  for (const idx of indices) {
+    if (state.items[idx]) {
+      state.items[idx].deleteStatus = { phase: "removing" }
     }
-  })
-
-  state.mode = { type: "deleting", progress, withBranch }
+  }
+  state.selected.clear()
   state.message = null
   rerender()
 
-  // Run the actual deletes in a fire-and-forget async block.
-  // Each step updates progress + re-renders, keeping the TUI alive.
   ;(async () => {
-    const resultLines: string[] = []
     let needsForce = false
 
-    for (let i = 0; i < indices.length; i++) {
-      const idx = indices[i]
+    for (const idx of indices) {
       const item = state.items[idx]
       if (!item) continue
       const wt = item.worktree
-      const entry = progress[i]
 
       // Step 1: remove worktree
-      entry.status = "removing"
+      item.deleteStatus = { phase: "removing" }
       rerender()
 
       const removeResult = await removeWorktree(wt.path, force)
@@ -447,24 +465,17 @@ function startDelete(
       if (removeResult.ok) {
         // Step 2 (optional): delete branch
         if (withBranch && wt.branch) {
-          entry.status = "branch"
+          item.deleteStatus = { phase: "branch" }
           rerender()
 
           const branchResult = await deleteBranch(wt.branch, true)
           if (branchResult.ok) {
-            entry.status = "done"
-            entry.message = "worktree + branch removed"
-            resultLines.push(`${c.green("\u2713")} Removed ${entry.label} + branch`)
+            item.deleteStatus = { phase: "done", message: "worktree + branch removed" }
           } else {
-            entry.status = "done"
-            entry.message = `branch: ${branchResult.error}`
-            resultLines.push(`${c.green("\u2713")} Removed ${entry.label}`)
-            resultLines.push(`${c.red("\u2717")} Branch ${wt.branch}: ${branchResult.error}`)
+            item.deleteStatus = { phase: "done", message: `branch: ${branchResult.error}` }
           }
         } else {
-          entry.status = "done"
-          entry.message = "removed"
-          resultLines.push(`${c.green("\u2713")} Removed ${entry.label}`)
+          item.deleteStatus = { phase: "done", message: "removed" }
         }
       } else {
         const isUncommitted =
@@ -475,39 +486,48 @@ function startDelete(
 
         if (isUncommitted && !force) {
           needsForce = true
-          entry.status = "needs-force"
-          resultLines.push(`${c.yellow("!")} ${entry.label}: has uncommitted changes`)
+          item.deleteStatus = { phase: "needs-force" }
         } else {
-          entry.status = "error"
-          entry.message = removeResult.error
-          resultLines.push(`${c.red("\u2717")} ${entry.label}: ${removeResult.error}`)
+          item.deleteStatus = { phase: "error", message: removeResult.error ?? "unknown error" }
         }
       }
 
       rerender()
     }
 
-    // All items processed. Refresh the worktree list.
-    await refreshWorktrees(state)
-    startPrFetching(state, rerender)
-    startFileStatusFetching(state, rerender)
-    startSizeFetching(state, rerender)
+    // Brief pause so the user can see the final status of each item
+    await Bun.sleep(600)
 
-    if (needsForce) {
-      state.mode = {
-        type: "result",
-        lines: [
-          ...resultLines,
-          "",
-          `${c.yellow("Some worktrees have uncommitted changes.")}`,
-          `${c.dim("Select them again and press")} ${c.cyan("d")} ${c.dim("to retry with force.")}`,
-        ],
+    // Remove successfully deleted items from the list
+    const removedIndices = new Set(
+      indices.filter((idx) => state.items[idx]?.deleteStatus?.phase === "done"),
+    )
+    // Clear delete status on items that weren't removed (errors, needs-force)
+    for (const idx of indices) {
+      if (state.items[idx] && !removedIndices.has(idx)) {
+        state.items[idx].deleteStatus = null
       }
-    } else {
-      state.mode = { type: "result", lines: resultLines }
     }
 
-    state.message = null
+    if (removedIndices.size > 0) {
+      // Rebuild item list without deleted items
+      state.items = state.items.filter((_, i) => !removedIndices.has(i))
+      state.cursor = Math.min(state.cursor, Math.max(0, state.items.length - 1))
+    }
+
+    if (needsForce) {
+      state.message = {
+        text: "Some worktrees have uncommitted changes. Select and press d to force.",
+        kind: "error",
+      }
+    } else if (removedIndices.size > 0) {
+      const n = removedIndices.size
+      state.message = {
+        text: `${n} worktree${n > 1 ? "s" : ""} removed.`,
+        kind: "success",
+      }
+    }
+
     rerender()
   })()
 }
@@ -525,6 +545,9 @@ async function refreshWorktrees(state: State): Promise<void> {
       prStatus: { type: "loading" as const },
       fileStatus: { type: "loading" as const },
       dirSize: { type: "loading" as const },
+      sessionInfo: { type: "loading" as const },
+      parentSession: { type: "loading" as const },
+      deleteStatus: null,
     }))
 
   state.selected.clear()
@@ -665,6 +688,91 @@ function startFileStatusFetching(state: State, rerender: () => void): void {
 }
 
 // ---------------------------------------------------------------------------
+// Async session info fetching (background, concurrent)
+// ---------------------------------------------------------------------------
+
+const SESSION_CONCURRENCY = 6
+
+/**
+ * Fetch Claude Code session info for all worktrees in background.
+ * Reads local files only (no network), so fast.
+ */
+function startSessionFetching(state: State, rerender: () => void): void {
+  const entries = state.items.map((item, index) => ({
+    path: item.worktree.path,
+    index,
+  }))
+
+  const executing: Promise<void>[] = []
+
+  const fetchOne = async ({ path, index }: { path: string; index: number }) => {
+    try {
+      const result = await fetchWorktreeSessionInfo(path)
+      if (state.items[index]?.worktree.path === path) {
+        state.items[index].sessionInfo = result
+      }
+    } catch {
+      if (state.items[index]?.worktree.path === path) {
+        state.items[index].sessionInfo = { type: "none" }
+      }
+    }
+    rerender()
+  }
+
+  ;(async () => {
+    for (const entry of entries) {
+      const task = fetchOne(entry)
+      executing.push(task)
+      task.then(() => {
+        const idx = executing.indexOf(task)
+        if (idx !== -1) executing.splice(idx, 1)
+      })
+
+      if (executing.length >= SESSION_CONCURRENCY) {
+        await Promise.race(executing)
+      }
+    }
+    await Promise.all(executing)
+  })()
+}
+
+// ---------------------------------------------------------------------------
+// Async parent session detection (background)
+// ---------------------------------------------------------------------------
+
+/**
+ * For each worktree, find the active Claude Code session that created it.
+ * Runs findParentSession() for each worktree concurrently.
+ * Since this involves grepping JSONL files it's the slowest fetch --
+ * runs after the faster fetches have already populated the UI.
+ */
+function startParentSessionFetching(state: State, rerender: () => void): void {
+  const entries = state.items.map((item, index) => ({
+    path: item.worktree.path,
+    index,
+  }))
+
+  // Run all concurrently -- findParentSession already limits grep parallelism internally
+  ;(async () => {
+    await Promise.all(
+      entries.map(async ({ path, index }) => {
+        try {
+          const result = await findParentSession(path)
+          if (state.items[index]?.worktree.path === path) {
+            state.items[index].parentSession = result
+          }
+        } catch {
+          if (state.items[index]?.worktree.path === path) {
+            state.items[index].parentSession = { type: "none" }
+          }
+        }
+        rerender()
+      }),
+    )
+  })()
+}
+
+// ---------------------------------------------------------------------------
 // Async directory size fetching (background, sequential)
 // ---------------------------------------------------------------------------
 
@@ -701,24 +809,29 @@ function startSizeFetching(state: State, rerender: () => void): void {
 async function handleBrowseKey(state: State, key: Key): Promise<void> {
   const ch = keyChar(key)
 
-  // Navigation (collapse expand on cursor move)
+  // Navigation (collapse expand on cursor move, skip items being deleted)
   if (key === "up" || ch === "k") {
-    state.cursor = Math.max(0, state.cursor - 1)
+    let next = state.cursor - 1
+    while (next >= 0 && state.items[next]?.deleteStatus) next--
+    if (next >= 0) state.cursor = next
     state.expandedIndex = null
     state.expandedFiles = null
     state.message = null
     return
   }
   if (key === "down" || ch === "j") {
-    state.cursor = Math.min(state.items.length - 1, state.cursor + 1)
+    let next = state.cursor + 1
+    while (next < state.items.length && state.items[next]?.deleteStatus) next++
+    if (next < state.items.length) state.cursor = next
     state.expandedIndex = null
     state.expandedFiles = null
     state.message = null
     return
   }
 
-  // Selection
+  // Selection (skip items being deleted)
   if (key === "space") {
+    if (state.items[state.cursor]?.deleteStatus) return
     if (state.selected.has(state.cursor)) {
       state.selected.delete(state.cursor)
     } else {
@@ -793,6 +906,8 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     await refreshWorktrees(state)
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
+    startSessionFetching(state, () => render(state))
+    startParentSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
     state.message = { text: "Refreshed.", kind: "success" }
     return
@@ -900,6 +1015,8 @@ async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
       await refreshWorktrees(state)
       startPrFetching(state, () => render(state))
       startFileStatusFetching(state, () => render(state))
+      startSessionFetching(state, () => render(state))
+      startParentSessionFetching(state, () => render(state))
       startSizeFetching(state, () => render(state))
       state.mode = {
         type: "result",
@@ -933,13 +1050,21 @@ async function printListAndExit(): Promise<void> {
   console.log(`  ${c.bold(fellLogo())}  ${c.dim("--list")}`)
   console.log()
 
-  // Fetch file statuses for all worktrees concurrently
-  const fileStatuses = await Promise.all(
-    worktrees.map(async (wt) => {
-      if (wt.isBare) return { type: "clean" as const }
-      return fetchWorktreeFileStatus(wt.path)
-    }),
-  )
+  // Fetch file statuses, session info, and parent sessions concurrently
+  const [fileStatuses, sessionInfos, parentSessions] = await Promise.all([
+    Promise.all(
+      worktrees.map(async (wt) => {
+        if (wt.isBare) return { type: "clean" as const }
+        return fetchWorktreeFileStatus(wt.path)
+      }),
+    ),
+    Promise.all(
+      worktrees.map(async (wt) => fetchWorktreeSessionInfo(wt.path)),
+    ),
+    Promise.all(
+      worktrees.map(async (wt) => findParentSession(wt.path)),
+    ),
+  ])
 
   for (let i = 0; i < worktrees.length; i++) {
     const wt = worktrees[i]
@@ -955,14 +1080,29 @@ async function printListAndExit(): Promise<void> {
     let path = wt.path
     if (home && path.startsWith(home)) path = "~" + path.slice(home.length)
 
+    // Inline parent session indicator (orange dot)
+    const parentInline = formatParentSessionInline(parentSessions[i])
+    const parentSuffix = parentInline ? `  ${parentInline}` : ""
+
     console.log(
-      `  ${branch.padEnd(35)} ${c.dim(sha)}  ${c.dim(path)}${tagStr}`,
+      `  ${branch.padEnd(35)} ${c.dim(sha)}  ${c.dim(path)}${tagStr}${parentSuffix}`,
     )
 
     // Sub-line for dirty file status
     const fsLine = formatFileStatus(fileStatuses[i])
     if (fsLine) {
       console.log(`     ${fsLine}`)
+    }
+
+    // Sub-lines for session info + parent session detail (--list shows expanded by default)
+    const cols = process.stdout.columns ?? 100
+    const sessLine = formatSessionInfo(sessionInfos[i], cols - 20)
+    if (sessLine) {
+      console.log(`     ${sessLine}`)
+    }
+    const parentLines = formatParentSessionExpanded(parentSessions[i], cols - 20)
+    for (const pl of parentLines) {
+      console.log(`     ${pl}`)
     }
   }
 
@@ -1027,8 +1167,8 @@ function startSpinnerTimer(
     const hasLoading = state.items.some(
       (i) => i.prStatus.type === "loading" || i.dirSize.type === "loading",
     )
-    const isDeleting = state.mode.type === "deleting"
-    if (hasLoading || isDeleting) {
+    const hasDeleting = state.items.some((i) => i.deleteStatus !== null)
+    if (hasLoading || hasDeleting) {
       state.spinnerFrame =
         (state.spinnerFrame + 1) % SPINNER_FRAMES.length
       rerender()
@@ -1085,6 +1225,9 @@ async function main() {
       prStatus: { type: "loading" },
       fileStatus: { type: "loading" },
       dirSize: { type: "loading" },
+      sessionInfo: { type: "loading" },
+      parentSession: { type: "loading" },
+      deleteStatus: null,
     })),
     mainWorktree,
     cursor: 0,
@@ -1134,9 +1277,11 @@ async function main() {
     // Initial render
     render(state)
 
-    // Start background PR fetching, file status checks, and size estimation
+    // Start background fetching: PR, file status, sessions, parent sessions, size
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
+    startSessionFetching(state, () => render(state))
+    startParentSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
 
     // Start spinner animation timer
@@ -1167,13 +1312,6 @@ async function main() {
 
         case "confirm-prune":
           await handleConfirmPruneKey(state, key)
-          break
-
-        case "deleting":
-          // Background delete in progress - ignore keys (spinner keeps animating via timer)
-          if (key === "ctrl-c" || key === "escape" || keyChar(key) === "q") {
-            state.shouldQuit = true
-          }
           break
 
         case "result":
