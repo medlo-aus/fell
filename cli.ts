@@ -49,7 +49,8 @@ import {
   formatPrStatus,
   formatFileStatus,
   formatSessionInfo,
-  formatParentSession,
+  formatParentSessionInline,
+  formatParentSessionExpanded,
   fellLogo,
   renderHelpLines,
   printCliHelp,
@@ -186,7 +187,11 @@ function renderRow(
       break
   }
 
-  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pad(pr, 18)}${sizeStr}${tagStr}`
+  // Inline parent session indicator (orange dot on the main row)
+  const parentInline = formatParentSessionInline(item.parentSession)
+  const parentSuffix = parentInline ? `  ${parentInline}` : ""
+
+  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pad(pr, 18)}${sizeStr}${tagStr}${parentSuffix}`
   const lines = [mainLine]
 
   // Sub-line: dirty file status with warning icon, indented under the branch name
@@ -196,22 +201,23 @@ function renderRow(
     lines.push(`        ${fileStatusLine}`)
   }
 
-  // Sub-line: Claude Code session info
-  const cols = process.stdout.columns ?? 100
-  const sessionLine = formatSessionInfo(item.sessionInfo, cols - 30)
-  if (sessionLine) {
-    lines.push(`        ${sessionLine}`)
-  }
-
-  // Sub-line: parent session (which active Claude session created this worktree)
-  const parentLine = formatParentSession(item.parentSession, cols - 20)
-  if (parentLine) {
-    lines.push(`        ${parentLine}`)
-  }
-
-  // Expanded file list (progressive disclosure via "e" key)
+  // Expanded detail (progressive disclosure via "e" key)
   const MAX_EXPANDED_FILES = 12
+  const cols = process.stdout.columns ?? 100
   if (state.expandedIndex === index) {
+    // Session info (only in expanded view)
+    const sessionLine = formatSessionInfo(item.sessionInfo, cols - 30)
+    if (sessionLine) {
+      lines.push(`        ${sessionLine}`)
+    }
+
+    // Parent session detail (only in expanded view)
+    const parentLines = formatParentSessionExpanded(item.parentSession, cols - 20)
+    for (const pl of parentLines) {
+      lines.push(`        ${pl}`)
+    }
+
+    // File list
     if (state.expandedFiles === null) {
       const frame = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]
       lines.push(`        ${c.dim(`${frame} loading files...`)}`)
@@ -1077,8 +1083,12 @@ async function printListAndExit(): Promise<void> {
     let path = wt.path
     if (home && path.startsWith(home)) path = "~" + path.slice(home.length)
 
+    // Inline parent session indicator (orange dot)
+    const parentInline = formatParentSessionInline(parentSessions[i])
+    const parentSuffix = parentInline ? `  ${parentInline}` : ""
+
     console.log(
-      `  ${branch.padEnd(35)} ${c.dim(sha)}  ${c.dim(path)}${tagStr}`,
+      `  ${branch.padEnd(35)} ${c.dim(sha)}  ${c.dim(path)}${tagStr}${parentSuffix}`,
     )
 
     // Sub-line for dirty file status
@@ -1087,17 +1097,15 @@ async function printListAndExit(): Promise<void> {
       console.log(`     ${fsLine}`)
     }
 
-    // Sub-line for Claude Code session info
+    // Sub-lines for session info + parent session detail (--list shows expanded by default)
     const cols = process.stdout.columns ?? 100
     const sessLine = formatSessionInfo(sessionInfos[i], cols - 20)
     if (sessLine) {
       console.log(`     ${sessLine}`)
     }
-
-    // Sub-line for parent session (which active Claude session spawned this worktree)
-    const parentLine = formatParentSession(parentSessions[i], cols - 20)
-    if (parentLine) {
-      console.log(`     ${parentLine}`)
+    const parentLines = formatParentSessionExpanded(parentSessions[i], cols - 20)
+    for (const pl of parentLines) {
+      console.log(`     ${pl}`)
     }
   }
 

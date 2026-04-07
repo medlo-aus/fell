@@ -267,33 +267,45 @@ export function formatSessionInfo(
 // Parent session formatting
 // ---------------------------------------------------------------------------
 
+/** Orange 256-colour code for Claude/session indicators. */
+const orange = (s: string) => `\x1b[38;5;208m${s}\x1b[0m`
+
 /**
- * Render a parent session sub-line for a worktree.
- * Shows which active Claude Code session created this worktree.
- * Returns null if no parent session or still loading.
+ * Render an inline orange dot indicator for worktrees with an active parent session.
+ * Shown on the main row (not a sub-line). Returns empty string if no parent session.
  */
-export function formatParentSession(
+export function formatParentSessionInline(result: ParentSessionResult): string {
+  if (result.type !== "found") return ""
+  return orange("\u25CF") + " " + c.dim("session")
+}
+
+/**
+ * Render expanded parent session detail lines (shown when user presses "e").
+ * Includes the parent session's CWD and prompt summary.
+ */
+export function formatParentSessionExpanded(
   result: ParentSessionResult,
   maxWidth: number,
-): string | null {
-  if (result.type !== "found") return null
+): string[] {
+  if (result.type !== "found") return []
 
   const { cwd, prompt } = result.session
-
   const home = process.env.HOME ?? ""
   let cwdDisplay = cwd
   if (home && cwdDisplay.startsWith(home)) {
     cwdDisplay = "~" + cwdDisplay.slice(home.length)
   }
 
-  const parts = [c.cyan("\u2190"), c.dim(truncate(cwdDisplay, 30))]
+  const lines: string[] = []
+  const label = `${orange("\u25CF")} ${c.dim("session")} ${c.dim("\u00B7")} ${c.dim(truncate(cwdDisplay, 35))}`
 
   if (prompt) {
-    parts.push(c.dim("\u00B7"))
-    parts.push(c.dim(c.italic(`"${truncate(prompt, maxWidth - 40)}"`)))
+    lines.push(`${label} ${c.dim("\u00B7")} ${c.dim(c.italic(`"${truncate(prompt, maxWidth - 50)}"`))}`)
+  } else {
+    lines.push(label)
   }
 
-  return parts.join(" ")
+  return lines
 }
 
 // ---------------------------------------------------------------------------
