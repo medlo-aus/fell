@@ -251,7 +251,9 @@ export function renderHelpLines(): string[] {
 
 export function printCliHelp(): void {
   console.log()
-  console.log(c.bold("  fell") + c.dim("  Interactive git worktree manager"))
+  console.log(`  ${c.dim(".'  _.-----")}${c.bold("| ")}${c.dim(" |")}`)
+  console.log(`  ${c.dim("|   _|  -__|")}${c.bold("  ")}${c.dim("|  |")}  ${c.dim("Interactive git worktree manager")}`)
+  console.log(`  ${c.dim("|__| |_____|")}${c.bold("__")}${c.dim("|__|")}`)
   console.log()
   console.log(c.yellow("  USAGE"))
   console.log()

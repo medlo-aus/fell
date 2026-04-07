@@ -207,7 +207,9 @@ function render(state: State): void {
     state.selected.size > 0
       ? `  ${c.lime(`${state.selected.size} selected`)}`
       : ""
-  lines.push(`  ${c.bold("fell")}${selectedInfo}`)
+  lines.push(`  ${c.dim(".'  _.-----")}${c.bold("| ")}${c.dim(" |")}`)
+  lines.push(`  ${c.dim("|   _|  -__|")}${c.bold("  ")}${c.dim("|  |")}${selectedInfo}`)
+  lines.push(`  ${c.dim("|__| |_____|")}${c.bold("__")}${c.dim("|__|")}`)
   lines.push("")
 
   // Main worktree (always visible, non-interactive)
@@ -876,7 +878,9 @@ async function printListAndExit(): Promise<void> {
   const ghDiagnostic = await checkGhStatus()
 
   console.log()
-  console.log(c.bold("  fell --list"))
+  console.log(`  ${c.dim(".'  _.-----")}${c.bold("| ")}${c.dim(" |")}`)
+  console.log(`  ${c.dim("|   _|  -__|")}${c.bold("  ")}${c.dim("|  |")}  ${c.dim("--list")}`)
+  console.log(`  ${c.dim("|__| |_____|")}${c.bold("__")}${c.dim("|__|")}`)
   console.log()
 
   // Fetch file statuses for all worktrees concurrently
