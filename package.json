@@ -1,6 +1,6 @@
 {
   "name": "@doccy/fell",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Interactive git worktree manager. Navigate, inspect, delete, and prune worktrees with async PR status fetching.",
   "license": "MIT",
   "bin": {
