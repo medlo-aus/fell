@@ -63,7 +63,7 @@ q / ctrl+c        Quit
 
 ### Preview
 
-<img src="./docs/header-img.png" height="300px">
+<video src="./docs/fell-demo.mp4" autoplay loop muted playsinline></video>
 
 ## License
 
