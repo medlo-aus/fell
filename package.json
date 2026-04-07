@@ -1,5 +1,5 @@
 {
-  "name": "@medlo-aus/fell",
+  "name": "@doccy/fell",
   "version": "0.1.0",
   "description": "Interactive git worktree manager. Navigate, inspect, delete, and prune worktrees with async PR status fetching.",
   "license": "MIT",

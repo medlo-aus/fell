@@ -20,7 +20,7 @@ Git worktrees accumulate. Agent tools (Cursor, Claude Code) create them freely. 
 ## Install
 
 ```bash
-bun add -g @medlo-aus/fell
+bun add -g @doccy/fell
 ```
 
 Requires [Bun](https://bun.sh) and git. [GitHub CLI](https://cli.github.com) (`gh`) is optional -- enables PR status display.
@@ -55,12 +55,16 @@ q / ctrl+c        Quit
 - Focused item shows full path and PR title
 - PR numbers are clickable links in supported terminals (iTerm2, Kitty, WezTerm)
 
+
 ### Prune vs delete
 
 **prune** cleans up stale administrative references -- when a worktree directory has been manually deleted (`rm -rf`) but git still tracks it. Equivalent to `git worktree prune`. Safe: only affects already-missing worktrees.
 
 **delete** properly removes a worktree from disk and cleans up git tracking. Optionally also deletes the branch. Equivalent to `git worktree remove`. Destructive.
 
+### Preview
+
+<img src="./docs/header-img.png" height="300px">
 
 ## License
 
