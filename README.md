@@ -1,12 +1,23 @@
 ```
-  ▐▘ ▜  ▜  ▜
-  ▜▘ █▌ ▐  ▐
-  ▐  ▙▖ ▐▖ ▐▖
+                            
+   ▄▀▀         ▀▀█    ▀▀█   
+ ▄▄█▄▄   ▄▄▄     █      █   
+   █    █▀  █    █      █   
+   █    █▀▀▀▀    █      █   
+   █    ▀█▄▄▀    ▀▄▄    ▀▄▄ 
+                            
 ```
 
-Interactive git worktree manager. Navigate worktrees with arrow keys, view PR statuses, delete worktrees + branches, and prune stale references.
-
 *"To fell a tree."*
+
+## Why?
+
+`fell` is a CLI tool that help's you actively manage, prune and delete worktrees.
+
+Git worktrees accumulate. Agent tools (Cursor, Claude Code) create them freely. After a few weeks you have a dozen stale worktrees, some with merged PRs, some with unpushed changes, and `git worktree list` gives you a wall of paths with no context.
+
+`fell` shows you what each worktree actually is -- its PR status, whether it has uncommitted work, and how far behind it is -- so you can clean up confidently.
+
 
 ## Install
 
@@ -52,11 +63,6 @@ q / ctrl+c        Quit
 
 **delete** properly removes a worktree from disk and cleans up git tracking. Optionally also deletes the branch. Equivalent to `git worktree remove`. Destructive.
 
-## Why
-
-Git worktrees accumulate. Agent tools (Cursor, Claude Code) create them freely. After a few weeks you have a dozen stale worktrees, some with merged PRs, some with unpushed changes, and `git worktree list` gives you a wall of paths with no context.
-
-`fell` shows you what each worktree actually is -- its PR status, whether it has uncommitted work, and how far behind it is -- so you can clean up confidently.
 
 ## License
 

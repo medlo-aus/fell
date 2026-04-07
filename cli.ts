@@ -877,9 +877,8 @@ async function printListAndExit(): Promise<void> {
   const ghDiagnostic = await checkGhStatus()
 
   console.log()
-  console.log(`  ${c.dim("▐▘ ▜  ▜  ▜")}`)
-  console.log(`  ${c.dim("▜▘ █▌ ▐  ▐")}  ${c.dim("--list")}`)
-  console.log(`  ${c.dim("▐  ▙▖ ▐▖ ▐▖")}`)
+  console.log(`  ${c.dim("▐▘ █▌ ▐  ▐")}  ${c.dim("--list")}`)
+  console.log(`  ${c.dim("▜▘ ▙▖ ▐▖ ▐▖")}`)
   console.log()
 
   // Fetch file statuses for all worktrees concurrently
