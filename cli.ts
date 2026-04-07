@@ -26,12 +26,14 @@ import {
   formatBytes,
   openDirectory,
   checkGhStatus,
+  fetchWorktreeSessionInfo,
   type Worktree,
   type PrStatus,
   type FileStatusResult,
   type FileEntry,
   type DirSize,
   type GhDiagnostic,
+  type SessionResult,
 } from "./lib/git"
 import {
   c,
@@ -44,6 +46,7 @@ import {
   shortenPath,
   formatPrStatus,
   formatFileStatus,
+  formatSessionInfo,
   fellLogo,
   renderHelpLines,
   printCliHelp,
@@ -59,6 +62,7 @@ interface WorktreeItem {
   prStatus: PrStatus
   fileStatus: FileStatusResult
   dirSize: DirSize
+  sessionInfo: SessionResult
 }
 
 /** Per-item progress entry for the deleting status line. */
@@ -186,6 +190,13 @@ function renderRow(
   if (fileStatusLine) {
     //       cursor+check+space = "  X X " = 6 chars, then indent to align under branch
     lines.push(`        ${fileStatusLine}`)
+  }
+
+  // Sub-line: Claude Code session info
+  const cols = process.stdout.columns ?? 100
+  const sessionLine = formatSessionInfo(item.sessionInfo, cols - 30)
+  if (sessionLine) {
+    lines.push(`        ${sessionLine}`)
   }
 
   // Expanded file list (progressive disclosure via "e" key)
@@ -491,6 +502,7 @@ function startDelete(
     await refreshWorktrees(state)
     startPrFetching(state, rerender)
     startFileStatusFetching(state, rerender)
+    startSessionFetching(state, rerender)
     startSizeFetching(state, rerender)
 
     if (needsForce) {
@@ -525,6 +537,7 @@ async function refreshWorktrees(state: State): Promise<void> {
       prStatus: { type: "loading" as const },
       fileStatus: { type: "loading" as const },
       dirSize: { type: "loading" as const },
+      sessionInfo: { type: "loading" as const },
     }))
 
   state.selected.clear()
@@ -665,6 +678,55 @@ function startFileStatusFetching(state: State, rerender: () => void): void {
 }
 
 // ---------------------------------------------------------------------------
+// Async session info fetching (background, concurrent)
+// ---------------------------------------------------------------------------
+
+const SESSION_CONCURRENCY = 6
+
+/**
+ * Fetch Claude Code session info for all worktrees in background.
+ * Reads local files only (no network), so fast.
+ */
+function startSessionFetching(state: State, rerender: () => void): void {
+  const entries = state.items.map((item, index) => ({
+    path: item.worktree.path,
+    index,
+  }))
+
+  const executing: Promise<void>[] = []
+
+  const fetchOne = async ({ path, index }: { path: string; index: number }) => {
+    try {
+      const result = await fetchWorktreeSessionInfo(path)
+      if (state.items[index]?.worktree.path === path) {
+        state.items[index].sessionInfo = result
+      }
+    } catch {
+      if (state.items[index]?.worktree.path === path) {
+        state.items[index].sessionInfo = { type: "none" }
+      }
+    }
+    rerender()
+  }
+
+  ;(async () => {
+    for (const entry of entries) {
+      const task = fetchOne(entry)
+      executing.push(task)
+      task.then(() => {
+        const idx = executing.indexOf(task)
+        if (idx !== -1) executing.splice(idx, 1)
+      })
+
+      if (executing.length >= SESSION_CONCURRENCY) {
+        await Promise.race(executing)
+      }
+    }
+    await Promise.all(executing)
+  })()
+}
+
+// ---------------------------------------------------------------------------
 // Async directory size fetching (background, sequential)
 // ---------------------------------------------------------------------------
 
@@ -793,6 +855,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     await refreshWorktrees(state)
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
+    startSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
     state.message = { text: "Refreshed.", kind: "success" }
     return
@@ -900,6 +963,7 @@ async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
       await refreshWorktrees(state)
       startPrFetching(state, () => render(state))
       startFileStatusFetching(state, () => render(state))
+      startSessionFetching(state, () => render(state))
       startSizeFetching(state, () => render(state))
       state.mode = {
         type: "result",
@@ -933,13 +997,18 @@ async function printListAndExit(): Promise<void> {
   console.log(`  ${c.bold(fellLogo())}  ${c.dim("--list")}`)
   console.log()
 
-  // Fetch file statuses for all worktrees concurrently
-  const fileStatuses = await Promise.all(
-    worktrees.map(async (wt) => {
-      if (wt.isBare) return { type: "clean" as const }
-      return fetchWorktreeFileStatus(wt.path)
-    }),
-  )
+  // Fetch file statuses and session info for all worktrees concurrently
+  const [fileStatuses, sessionInfos] = await Promise.all([
+    Promise.all(
+      worktrees.map(async (wt) => {
+        if (wt.isBare) return { type: "clean" as const }
+        return fetchWorktreeFileStatus(wt.path)
+      }),
+    ),
+    Promise.all(
+      worktrees.map(async (wt) => fetchWorktreeSessionInfo(wt.path)),
+    ),
+  ])
 
   for (let i = 0; i < worktrees.length; i++) {
     const wt = worktrees[i]
@@ -963,6 +1032,13 @@ async function printListAndExit(): Promise<void> {
     const fsLine = formatFileStatus(fileStatuses[i])
     if (fsLine) {
       console.log(`     ${fsLine}`)
+    }
+
+    // Sub-line for Claude Code session info
+    const cols = process.stdout.columns ?? 100
+    const sessLine = formatSessionInfo(sessionInfos[i], cols - 20)
+    if (sessLine) {
+      console.log(`     ${sessLine}`)
     }
   }
 
@@ -1085,6 +1161,7 @@ async function main() {
       prStatus: { type: "loading" },
       fileStatus: { type: "loading" },
       dirSize: { type: "loading" },
+      sessionInfo: { type: "loading" },
     })),
     mainWorktree,
     cursor: 0,
@@ -1134,9 +1211,10 @@ async function main() {
     // Initial render
     render(state)
 
-    // Start background PR fetching, file status checks, and size estimation
+    // Start background PR fetching, file status, sessions, and size estimation
     startPrFetching(state, () => render(state))
     startFileStatusFetching(state, () => render(state))
+    startSessionFetching(state, () => render(state))
     startSizeFetching(state, () => render(state))
 
     // Start spinner animation timer

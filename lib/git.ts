@@ -435,3 +435,144 @@ export async function fetchPrForBranch(
     return null
   }
 }
+
+// ---------------------------------------------------------------------------
+// Claude Code session lookups
+// ---------------------------------------------------------------------------
+
+export interface SessionInfo {
+  sessionCount: number
+  latestSessionId: string
+  /** First user message content from the most recent session, truncated. */
+  latestPrompt: string
+  /** ISO timestamp from the first user message. */
+  latestTimestamp: string
+}
+
+export type SessionResult =
+  | { type: "loading" }
+  | { type: "found"; info: SessionInfo }
+  | { type: "none" }
+
+/**
+ * Encode an absolute path into Claude Code's project directory name.
+ * Claude replaces all non-alphanumeric characters with `-`,
+ * so `/Users/x/.claude/worktrees/foo` becomes
+ * `-Users-x--claude-worktrees-foo` (`.` and `/` both become `-`).
+ */
+function encodeClaudeProjectPath(absolutePath: string): string {
+  return absolutePath.replace(/[^a-zA-Z0-9]/g, "-")
+}
+
+/**
+ * Extract the first user prompt from a Claude Code session JSONL file.
+ * Reads only the first ~15 lines for performance -- the user message
+ * is almost always within the first few entries.
+ */
+async function extractFirstPrompt(
+  jsonlPath: string,
+): Promise<{ prompt: string; timestamp: string } | null> {
+  try {
+    const content = await Bun.file(jsonlPath).text()
+    const lines = content.split("\n").slice(0, 15)
+
+    for (const line of lines) {
+      if (!line.trim()) continue
+      try {
+        const entry = JSON.parse(line)
+        if (entry.type !== "user") continue
+
+        const rawContent = entry.message?.content
+        let text = ""
+        if (typeof rawContent === "string") {
+          text = rawContent
+        } else if (Array.isArray(rawContent)) {
+          // Array of content blocks: [{ type: "text", text: "..." }, ...]
+          const textBlock = rawContent.find(
+            (b: { type: string }) => b.type === "text",
+          )
+          text = textBlock?.text ?? ""
+        }
+
+        // Strip XML-like tags (e.g. <local-command-caveat>...) that aren't real prompts
+        if (text.startsWith("<")) {
+          // Try to find actual text after tags
+          const stripped = text.replace(/<[^>]+>[^<]*<\/[^>]+>/g, "").trim()
+          if (stripped) text = stripped
+          else continue // skip entries that are purely XML tags
+        }
+
+        // Collapse whitespace/newlines into single spaces for display
+        text = text.trim().replace(/\s+/g, " ")
+        if (!text) continue
+
+        return {
+          prompt: text,
+          timestamp: entry.timestamp ?? "",
+        }
+      } catch {
+        // Skip malformed lines
+      }
+    }
+  } catch {
+    // File read failed
+  }
+  return null
+}
+
+/**
+ * Look up Claude Code session info for a worktree by reading
+ * `~/.claude/projects/{encoded-path}/` directly.
+ *
+ * Assumption: Claude Code encodes the worktree CWD by replacing `/` with `-`
+ * to form the project directory name. Each `{uuid}.jsonl` file inside is a
+ * session transcript. This is an undocumented internal format and may change.
+ */
+export async function fetchWorktreeSessionInfo(
+  worktreePath: string,
+): Promise<SessionResult> {
+  const home = process.env.HOME
+  if (!home) return { type: "none" }
+
+  const encoded = encodeClaudeProjectPath(worktreePath)
+  const projectDir = `${home}/.claude/projects/${encoded}`
+
+  try {
+    const { readdir, stat } = await import("node:fs/promises")
+    const entries = await readdir(projectDir).catch(() => null)
+    if (!entries) return { type: "none" }
+
+    // Find all .jsonl files (each is a session)
+    const jsonlFiles = entries.filter((e) => e.endsWith(".jsonl"))
+    if (jsonlFiles.length === 0) return { type: "none" }
+
+    // Sort by mtime descending to find the most recent session
+    const withMtime = await Promise.all(
+      jsonlFiles.map(async (f) => {
+        const s = await stat(`${projectDir}/${f}`).catch(() => null)
+        return { file: f, mtime: s?.mtimeMs ?? 0 }
+      }),
+    )
+    withMtime.sort((a, b) => b.mtime - a.mtime)
+
+    const latestFile = withMtime[0].file
+    const latestSessionId = latestFile.replace(".jsonl", "")
+
+    // Extract first user prompt from the most recent session
+    const promptInfo = await extractFirstPrompt(
+      `${projectDir}/${latestFile}`,
+    )
+
+    return {
+      type: "found",
+      info: {
+        sessionCount: jsonlFiles.length,
+        latestSessionId,
+        latestPrompt: promptInfo?.prompt ?? "",
+        latestTimestamp: promptInfo?.timestamp ?? "",
+      },
+    }
+  } catch {
+    return { type: "none" }
+  }
+}

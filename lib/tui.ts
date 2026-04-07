@@ -4,7 +4,7 @@
  * and the help screen content.
  */
 
-import type { PrStatus, FileStatusResult } from "./git"
+import type { PrStatus, FileStatusResult, SessionResult } from "./git"
 
 // ---------------------------------------------------------------------------
 // ANSI escape helpers
@@ -235,6 +235,32 @@ export function formatFileStatus(result: FileStatusResult): string | null {
   if (parts.length === 0) return null
 
   return `${c.yellow("\u26A0")} ${parts.join(c.dim("  \u00B7  "))}`
+}
+
+// ---------------------------------------------------------------------------
+// Session info formatting
+// ---------------------------------------------------------------------------
+
+/**
+ * Render a Claude Code session sub-line for a worktree.
+ * Returns null if no sessions or still loading.
+ */
+export function formatSessionInfo(
+  result: SessionResult,
+  maxPromptWidth: number,
+): string | null {
+  if (result.type !== "found") return null
+
+  const { sessionCount, latestPrompt } = result.info
+  const s = sessionCount === 1 ? "session" : "sessions"
+  const count = c.dim(`${sessionCount} ${s}`)
+
+  if (!latestPrompt) {
+    return `${c.dim("\u25C8")} ${count}`
+  }
+
+  const prompt = truncate(latestPrompt, maxPromptWidth)
+  return `${c.dim("\u25C8")} ${count} ${c.dim("\u00B7")} ${c.dim(c.italic(`"${prompt}"`))}`
 }
 
 // ---------------------------------------------------------------------------
