@@ -146,10 +146,13 @@ export async function removeWorktree(
 /**
  * Dry-run prune to show what stale references would be cleaned.
  * Returns human-readable descriptions of each stale entry.
+ * Note: git writes prune verbose output to stderr, not stdout.
  */
 export async function pruneWorktreesDryRun(): Promise<string[]> {
   const result = await $`git worktree prune --dry-run -v`.nothrow().quiet()
-  return result.stdout.toString().trim().split("\n").filter(Boolean)
+  const output = result.stderr.toString().trim()
+  if (!output) return []
+  return output.split("\n").filter(Boolean)
 }
 
 /** Actually prune stale worktree references. */
