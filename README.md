@@ -1,18 +1,16 @@
 ```
-                            
    ▄▀▀         ▀▀█    ▀▀█   
  ▄▄█▄▄   ▄▄▄     █      █   
    █    █▀  █    █      █   
    █    █▀▀▀▀    █      █   
-   █    ▀█▄▄▀    ▀▄▄    ▀▄▄ 
-                            
+   █    ▀█▄▄▀    ▀▄▄    ▀▄▄                             
 ```
 
-*"To fell a tree."*
-
-## Why?
+*"To fell a tree."* 
 
 `fell` is a CLI tool that help's you actively manage, prune and delete worktrees.
+
+## Why?
 
 Git worktrees accumulate. Agent tools (Cursor, Claude Code) create them freely. After a few weeks you have a dozen stale worktrees, some with merged PRs, some with unpushed changes, and `git worktree list` gives you a wall of paths with no context.
 
