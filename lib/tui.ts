@@ -426,23 +426,29 @@ export function renderHelpLines(): string[] {
     `    ${c.cyan("a")}                 Select / deselect all`,
     `    ${c.cyan("e")}                 Expand / collapse file list for focused worktree`,
     `    ${c.cyan("o")}                 Open focused worktree in file manager`,
+    `    ${c.cyan("c")}                 Release focused or selected worktree(s) for recycling`,
     `    ${c.cyan("d")}                 Delete focused or selected worktree(s)`,
     `    ${c.cyan("p")}                 Prune stale worktree references`,
     `    ${c.cyan("r")}                 Refresh list + re-fetch PR statuses`,
     `    ${c.cyan("?")}                 Toggle this help screen`,
     `    ${c.cyan("q")} / ${c.cyan("ctrl+c")}        Quit`,
     "",
-    `  ${c.bold("PRUNE vs DELETE")}`,
+    `  ${c.bold("TERMINOLOGY")}`,
     "",
-    `    ${c.yellow("prune")}   Cleans up ${c.italic("stale administrative references")}. When a worktree`,
-    `            directory has been manually deleted (rm -rf) but git still`,
-    `            tracks it, prune removes those orphaned references.`,
-    `            ${c.dim("Safe: only affects already-missing worktrees.")}`,
+    `    ${c.yellow("release")} Detaches HEAD from a worktree without deleting the directory.`,
+    `            The worktree becomes an empty slot with its deps intact,`,
+    `            ready to be recycled for a new branch via ${c.cyan("fell --recycle")}.`,
+    `            ${c.dim("Non-destructive: directory and node_modules stay on disk.")}`,
     "",
     `    ${c.yellow("delete")}  ${c.italic("Properly removes")} a worktree: deletes the working directory`,
     `            and cleans up git tracking. Optionally also force-deletes`,
     `            the associated branch. Use for worktrees you no longer need.`,
     `            ${c.dim("Destructive: removes files from disk.")}`,
+    "",
+    `    ${c.yellow("prune")}   Cleans up ${c.italic("stale administrative references")}. When a worktree`,
+    `            directory has been manually deleted (rm -rf) but git still`,
+    `            tracks it, prune removes those orphaned references.`,
+    `            ${c.dim("Safe: only affects already-missing worktrees.")}`,
     "",
     `  ${c.dim("press ? or escape to return")}`,
   ]
@@ -458,9 +464,11 @@ export function printCliHelp(): void {
   console.log()
   console.log(c.yellow("  USAGE"))
   console.log()
-  console.log(`    ${c.dim("$")} fell            ${c.dim("Interactive mode (default)")}`)
-  console.log(`    ${c.dim("$")} fell ${c.cyan("--list")}     ${c.dim("Print worktrees and exit")}`)
-  console.log(`    ${c.dim("$")} fell ${c.cyan("--help")}     ${c.dim("Show this help")}`)
+  console.log(`    ${c.dim("$")} fell                          ${c.dim("Interactive mode (default)")}`)
+  console.log(`    ${c.dim("$")} fell ${c.cyan("--list")}                   ${c.dim("Print worktrees and exit")}`)
+  console.log(`    ${c.dim("$")} fell ${c.cyan("--recycle")} ${c.dim("<branch>")}         ${c.dim("Recycle a worktree for a new branch")}`)
+  console.log(`    ${c.dim("$")} fell ${c.cyan("--recycle")} ${c.dim("<branch>")} ${c.cyan("--slot")} ${c.dim("<path>")}  ${c.dim("Recycle a specific worktree")}`)
+  console.log(`    ${c.dim("$")} fell ${c.cyan("--help")}                   ${c.dim("Show this help")}`)
   console.log()
   console.log(c.yellow("  INTERACTIVE COMMANDS"))
   console.log()
@@ -469,20 +477,25 @@ export function printCliHelp(): void {
   console.log(`    ${c.cyan("a")}                 Select / deselect all`)
   console.log(`    ${c.cyan("e")}                 Expand / collapse file list`)
   console.log(`    ${c.cyan("o")}                 Open worktree in file manager`)
+  console.log(`    ${c.cyan("c")}                 Release worktree(s) for recycling (detach HEAD)`)
   console.log(`    ${c.cyan("d")}                 Delete worktree(s) + optionally branches`)
   console.log(`    ${c.cyan("p")}                 Prune stale references`)
   console.log(`    ${c.cyan("r")}                 Refresh list + PR statuses`)
-  console.log(`    ${c.cyan("?")}                 In-app help (prune vs delete explained)`)
+  console.log(`    ${c.cyan("?")}                 In-app help (terminology explained)`)
   console.log(`    ${c.cyan("q")} / ${c.cyan("ctrl+c")}        Quit`)
   console.log()
-  console.log(c.yellow("  PRUNE vs DELETE"))
+  console.log(c.yellow("  TERMINOLOGY"))
   console.log()
-  console.log(`    ${c.bold("prune")}   Removes stale git references to worktrees whose directories`)
-  console.log(`            no longer exist. Equivalent to ${c.cyan("git worktree prune")}.`)
-  console.log(`            Does ${c.underline("not")} touch any actual worktree directories.`)
+  console.log(`    ${c.bold("release")} Detaches HEAD from a worktree without deleting the directory.`)
+  console.log(`            The worktree becomes an empty slot with deps intact, ready`)
+  console.log(`            to be recycled for a new branch via ${c.cyan("fell --recycle <branch>")}.`)
   console.log()
   console.log(`    ${c.bold("delete")}  Removes the worktree directory from disk and cleans up git`)
   console.log(`            tracking. Equivalent to ${c.cyan("git worktree remove <path>")}.`)
   console.log(`            Optionally also deletes the associated branch.`)
+  console.log()
+  console.log(`    ${c.bold("prune")}   Removes stale git references to worktrees whose directories`)
+  console.log(`            no longer exist. Equivalent to ${c.cyan("git worktree prune")}.`)
+  console.log(`            Does ${c.underline("not")} touch any actual worktree directories.`)
   console.log()
 }

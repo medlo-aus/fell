@@ -207,6 +207,87 @@ export async function deleteBranch(
 }
 
 // ---------------------------------------------------------------------------
+// Worktree recycling operations
+// ---------------------------------------------------------------------------
+
+/**
+ * Detach HEAD in a worktree, disconnecting it from its current branch.
+ * Used to "release" a worktree for recycling.
+ */
+export async function detachHead(
+  worktreePath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const result = await $`git -C ${worktreePath} checkout --detach HEAD`
+    .nothrow()
+    .quiet()
+  if (result.exitCode !== 0) {
+    return { ok: false, error: result.stderr.toString().trim() }
+  }
+  return { ok: true }
+}
+
+/**
+ * Fetch from origin in a worktree.
+ */
+export async function fetchOrigin(
+  worktreePath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const result = await $`git -C ${worktreePath} fetch origin`
+    .nothrow()
+    .quiet()
+  if (result.exitCode !== 0) {
+    return { ok: false, error: result.stderr.toString().trim() }
+  }
+  return { ok: true }
+}
+
+/**
+ * Check out a new branch in an existing worktree.
+ * Tries remote tracking branch first (origin/<branch>),
+ * falls back to creating from origin/HEAD (default branch).
+ */
+export async function checkoutNewBranch(
+  worktreePath: string,
+  branch: string,
+): Promise<{ ok: boolean; error?: string }> {
+  // Try remote tracking branch first
+  const remote = await $`git -C ${worktreePath} checkout -b ${branch} origin/${branch}`
+    .nothrow()
+    .quiet()
+  if (remote.exitCode === 0) return { ok: true }
+
+  // Fall back to creating from origin/HEAD (default branch)
+  const fromDefault = await $`git -C ${worktreePath} checkout -b ${branch} origin/HEAD`
+    .nothrow()
+    .quiet()
+  if (fromDefault.exitCode === 0) return { ok: true }
+
+  return { ok: false, error: fromDefault.stderr.toString().trim() }
+}
+
+/**
+ * SHA-256 hash of the first lockfile found in a directory.
+ * Checks common lockfile names in order. Returns null if none found.
+ */
+export async function hashLockfile(
+  dirPath: string,
+): Promise<string | null> {
+  const lockfiles = [
+    "bun.lockb", "bun.lock", "yarn.lock",
+    "package-lock.json", "pnpm-lock.yaml",
+  ]
+  for (const name of lockfiles) {
+    const file = Bun.file(`${dirPath}/${name}`)
+    if (await file.exists()) {
+      const hasher = new Bun.CryptoHasher("sha256")
+      hasher.update(await file.arrayBuffer())
+      return hasher.digest("hex")
+    }
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
 // File status (per-worktree)
 // ---------------------------------------------------------------------------
 

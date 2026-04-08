@@ -10,13 +10,12 @@
 [![Bun](https://img.shields.io/badge/built%20with-Bun-fbf0df?style=flat&logo=bun&logoColor=f6dece)](https://bun.sh)
 [![TypeScript](https://img.shields.io/badge/100%25-TypeScript-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue?style=flat)](LICENSE.txt)
-[![Git](https://img.shields.io/badge/git-%E2%89%A52.17-F05032?style=flat&logo=git&logoColor=white)](https://git-scm.com/)
+[![npm](https://img.shields.io/npm/v/@doccy/fell?style=flat&label=version)](https://www.npmjs.com/package/@doccy/fell)
 [![Platform](https://img.shields.io/badge/macOS%20%7C%20Linux%20%7C%20Windows-858585?style=flat)](#platform-support)
 
 > CLI tool that help's you actively manage, prune and delete worktrees. *"To fell a tree."*
 
 <img src="./docs/fell-demo.gif" alt="fell demo" height="400px">
-
 
 
 ## Why?
@@ -37,9 +36,11 @@ Requires [Bun](https://bun.sh) and git. [GitHub CLI](https://cli.github.com) (`g
 ## Usage
 
 ```bash
-fell              # interactive TUI
-fell --list       # print worktrees + PR statuses and exit
-fell --help       # show help
+fell                              # interactive TUI
+fell --list                       # print worktrees + PR statuses and exit
+fell --recycle <branch>           # recycle a worktree for a new branch
+fell --recycle <branch> --slot <path>  # recycle a specific worktree
+fell --help                       # show help
 ```
 
 ### Interactive commands
@@ -50,26 +51,30 @@ space             Toggle selection
 a                 Select / deselect all
 e                 Expand / collapse file list
 o                 Open worktree in file manager
+c                 Release worktree(s) for recycling (detach HEAD)
 d                 Delete worktree(s) + optionally branches
 p                 Prune stale references
 r                 Refresh list + PR statuses
-?                 Help (prune vs delete explained)
+?                 Help (terminology explained)
 q / ctrl+c        Quit
 ```
 
 ### What you see
 
-- Branch name, short SHA, and PR status for each worktree
+- Branch name, PR status, size, and recyclable indicators for each worktree
 - File status sub-lines (staged, modified, untracked, unpushed, behind) with warning indicators
+- Expand (`e`) to see SHA, session info, and changed file list
 - Focused item shows full path and PR title
 - PR numbers are clickable links in supported terminals (iTerm2, Kitty, WezTerm)
 
 
-### Prune vs delete
+### Terminology
 
-**prune** cleans up stale administrative references -- when a worktree directory has been manually deleted (`rm -rf`) but git still tracks it. Equivalent to `git worktree prune`. Safe: only affects already-missing worktrees.
+**release** detaches HEAD from a worktree without deleting the directory. The worktree becomes an empty slot with its dependencies intact, ready to be recycled for a new branch via `fell --recycle <branch>`. Non-destructive.
 
 **delete** properly removes a worktree from disk and cleans up git tracking. Optionally also deletes the branch. Equivalent to `git worktree remove`. Destructive.
+
+**prune** cleans up stale administrative references -- when a worktree directory has been manually deleted (`rm -rf`) but git still tracks it. Equivalent to `git worktree prune`. Safe: only affects already-missing worktrees.
 
 ## License
 

@@ -19,6 +19,10 @@ import {
   pruneWorktreesDryRun,
   pruneWorktrees,
   deleteBranch,
+  detachHead,
+  fetchOrigin,
+  checkoutNewBranch,
+  hashLockfile,
   fetchPrForBranch,
   fetchWorktreeFileStatus,
   fetchWorktreeFileList,
@@ -69,6 +73,14 @@ type ItemDeleteStatus =
   | { phase: "error"; message: string }
   | { phase: "needs-force" }
 
+/** In-flight release status for an item. Null when not being released. */
+type ItemReleaseStatus =
+  | { phase: "detaching" }
+  | { phase: "branch" }
+  | { phase: "done"; message: string }
+  | { phase: "error"; message: string }
+  | { phase: "dirty" }
+
 interface WorktreeItem {
   worktree: Worktree
   prStatus: PrStatus
@@ -78,12 +90,15 @@ interface WorktreeItem {
   parentSession: ParentSessionResult
   /** Set during deletion. Null when the item is not being deleted. */
   deleteStatus: ItemDeleteStatus | null
+  /** Set during release. Null when the item is not being released. */
+  releaseStatus: ItemReleaseStatus | null
 }
 
 type Mode =
   | { type: "browse" }
   | { type: "confirm-delete"; indices: number[] }
   | { type: "confirm-force"; indices: number[]; withBranch: boolean }
+  | { type: "confirm-release"; indices: number[] }
   | { type: "confirm-prune"; candidates: string[] }
   | { type: "result"; lines: string[] }
   | { type: "help" }
@@ -131,6 +146,42 @@ function waitForKey(): Promise<Buffer> {
   return new Promise((resolve) => {
     process.stdin.once("data", (data: Buffer) => resolve(data))
   })
+}
+
+// ---------------------------------------------------------------------------
+// Recyclable status
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine whether a worktree is a good candidate for recycling.
+ * Returns a reason string for display, or null if not recyclable.
+ */
+function getRecyclableStatus(
+  item: WorktreeItem,
+): "released" | "merged" | null {
+  // Must be clean (no dirty files, no unpushed commits)
+  if (item.fileStatus.type === "dirty") {
+    const s = item.fileStatus.status
+    if (s.staged > 0 || s.modified > 0 || s.untracked > 0 || s.ahead > 0) {
+      return null
+    }
+  }
+  if (item.fileStatus.type !== "clean" && item.fileStatus.type !== "dirty") {
+    return null // loading or error = unknown
+  }
+
+  // Tier 1: explicitly released (detached + clean)
+  if (item.worktree.isDetached) return "released"
+
+  // Tier 2: PR merged + clean
+  if (
+    item.prStatus.type === "found" &&
+    item.prStatus.pr.state === "MERGED"
+  ) {
+    return "merged"
+  }
+
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +235,39 @@ function renderRow(
     return [`    ${icon} ${branchStr}${detail}`]
   }
 
+  // Items being released render as a dimmed single line with progress icon
+  if (item.releaseStatus) {
+    const branchRaw = wt.branch ?? "(detached)"
+    const branchStr = c.dim(truncate(branchRaw, BRANCH_COL))
+    const frame = SPINNER_FRAMES[state.spinnerFrame % SPINNER_FRAMES.length]
+
+    let icon: string
+    let detail = ""
+    switch (item.releaseStatus.phase) {
+      case "detaching":
+        icon = c.cyan(frame)
+        detail = c.dim(" detaching")
+        break
+      case "branch":
+        icon = c.cyan(frame)
+        detail = c.dim(" deleting branch")
+        break
+      case "done":
+        icon = c.green("\u2713")
+        detail = `  ${c.dim(item.releaseStatus.message)}`
+        break
+      case "error":
+        icon = c.red("\u2717")
+        detail = `  ${c.dim(item.releaseStatus.message)}`
+        break
+      case "dirty":
+        icon = c.yellow("!")
+        detail = c.dim(" has uncommitted changes")
+        break
+    }
+    return [`    ${icon} ${branchStr}${detail}`]
+  }
+
   const isFocused = index === state.cursor
   const isSelected = state.selected.has(index)
 
@@ -194,12 +278,13 @@ function renderRow(
   let branchStr = truncate(branchRaw, BRANCH_COL)
   branchStr = isFocused ? c.bold(branchStr) : branchStr
 
-  const sha = c.dim(wt.head.slice(0, SHA_COL))
-
-  // Indicators: locked, prunable
+  // Indicators: locked, prunable, recyclable
   const tags: string[] = []
   if (wt.isLocked) tags.push(c.yellow("locked"))
   if (wt.isPrunable) tags.push(c.red("prunable"))
+  const recyclable = getRecyclableStatus(item)
+  if (recyclable === "released") tags.push(c.green("recyclable"))
+  else if (recyclable === "merged") tags.push(c.dim("recyclable"))
   const tagStr = tags.length > 0 ? ` ${tags.join(" ")}` : ""
 
   const pr = formatPrStatus(item.prStatus, state.spinnerFrame)
@@ -227,7 +312,7 @@ function renderRow(
   const parentInline = formatParentSessionInline(item.parentSession)
   const parentSuffix = parentInline ? `  ${parentInline}` : ""
 
-  const mainLine = `  ${cursor} ${check} ${branchPadded}${sha}   ${pad(pr, 18)}${sizeStr}${tagStr}${parentSuffix}`
+  const mainLine = `  ${cursor} ${check} ${branchPadded}${pad(pr, 18)}${sizeStr}${tagStr}${parentSuffix}`
   const lines = [mainLine]
 
   // Sub-line: dirty file status with warning icon, indented under the branch name
@@ -241,6 +326,10 @@ function renderRow(
   const MAX_EXPANDED_FILES = 12
   const cols = process.stdout.columns ?? 100
   if (state.expandedIndex === index) {
+    // SHA (only in expanded view)
+    const sha = c.dim(wt.head.slice(0, SHA_COL))
+    lines.push(`        ${c.dim("sha")} ${sha}`)
+
     // Session info (only in expanded view)
     const sessionLine = formatSessionInfo(item.sessionInfo, cols - 30)
     if (sessionLine) {
@@ -295,10 +384,9 @@ function render(state: State): void {
   lines.push("")
 
   // Main worktree (always visible, non-interactive)
-  const mainSha = state.mainWorktree.head.slice(0, SHA_COL)
   const mainPath = shortenPath(state.mainWorktree.path, cols - 25)
   lines.push(
-    `  ${c.dim("  main")}  ${c.dim(mainSha)}  ${c.dim(mainPath)}`,
+    `  ${c.dim("  main")}  ${c.dim(mainPath)}`,
   )
   lines.push("")
 
@@ -364,7 +452,7 @@ function render(state: State): void {
     switch (state.mode.type) {
       case "browse": {
         lines.push(
-          `  ${c.dim("\u2191\u2193")} navigate  ${c.dim("\u2423")} select  ${c.dim("a")} all  ${c.dim("e")} expand  ${c.dim("o")} open  ${c.dim("d")} delete  ${c.dim("p")} prune  ${c.dim("?")} help  ${c.dim("q")} quit`,
+          `  ${c.dim("\u2191\u2193")} navigate  ${c.dim("\u2423")} select  ${c.dim("a")} all  ${c.dim("e")} expand  ${c.dim("o")} open  ${c.dim("c")} release  ${c.dim("d")} delete  ${c.dim("p")} prune  ${c.dim("?")} help  ${c.dim("q")} quit`,
         )
         break
       }
@@ -381,6 +469,14 @@ function render(state: State): void {
         const s = n > 1 ? "s" : ""
         lines.push(
           `  Worktree${s} ha${n > 1 ? "ve" : "s"} uncommitted changes. Force delete?  ${c.cyan("y")} force  ${c.cyan("n")} cancel`,
+        )
+        break
+      }
+      case "confirm-release": {
+        const n = state.mode.indices.length
+        const s = n > 1 ? "s" : ""
+        lines.push(
+          `  Release ${c.bold(String(n))} worktree${s} for recycling?  ${c.cyan("y")} confirm  ${c.cyan("b")} + delete branch${s}  ${c.cyan("n")} cancel`,
         )
         break
       }
@@ -532,6 +628,108 @@ function startDelete(
   })()
 }
 
+/**
+ * Run release operations inline within the worktree list.
+ * Mirrors startDelete but items stay in the list (updated to detached state)
+ * instead of being removed.
+ */
+function startRelease(
+  state: State,
+  indices: number[],
+  withBranch: boolean,
+  rerender: () => void,
+): void {
+  for (const idx of indices) {
+    if (state.items[idx]) {
+      state.items[idx].releaseStatus = { phase: "detaching" }
+    }
+  }
+  state.selected.clear()
+  state.message = null
+  rerender()
+
+  ;(async () => {
+    let hasDirty = false
+
+    for (const idx of indices) {
+      const item = state.items[idx]
+      if (!item) continue
+      const wt = item.worktree
+
+      // Check for dirty state (refuse to release)
+      const fs = item.fileStatus
+      if (fs.type === "dirty") {
+        const s = fs.status
+        if (s.staged > 0 || s.modified > 0 || s.untracked > 0 || s.ahead > 0) {
+          hasDirty = true
+          item.releaseStatus = { phase: "dirty" }
+          rerender()
+          continue
+        }
+      }
+
+      // Step 1: detach HEAD
+      item.releaseStatus = { phase: "detaching" }
+      rerender()
+
+      const detachResult = await detachHead(wt.path)
+
+      if (detachResult.ok) {
+        // Step 2 (optional): delete branch
+        if (withBranch && wt.branch) {
+          item.releaseStatus = { phase: "branch" }
+          rerender()
+
+          const branchResult = await deleteBranch(wt.branch, true)
+          if (branchResult.ok) {
+            item.releaseStatus = { phase: "done", message: "released + branch deleted" }
+          } else {
+            item.releaseStatus = { phase: "done", message: `released (branch: ${branchResult.error})` }
+          }
+        } else {
+          item.releaseStatus = { phase: "done", message: "released" }
+        }
+      } else {
+        item.releaseStatus = { phase: "error", message: detachResult.error ?? "unknown error" }
+      }
+
+      rerender()
+    }
+
+    // Brief pause so the user can see the final status
+    await Bun.sleep(600)
+
+    // Clear release status and refresh the full list so items update to detached state
+    for (const idx of indices) {
+      if (state.items[idx]) {
+        state.items[idx].releaseStatus = null
+      }
+    }
+
+    await refreshWorktrees(state)
+    startPrFetching(state, rerender)
+    startFileStatusFetching(state, rerender)
+    startSessionFetching(state, rerender)
+    startParentSessionFetching(state, rerender)
+    startSizeFetching(state, rerender)
+
+    if (hasDirty) {
+      state.message = {
+        text: "Some worktrees have uncommitted changes. Commit or stash before releasing.",
+        kind: "error",
+      }
+    } else {
+      const n = indices.length
+      state.message = {
+        text: `${n} worktree${n > 1 ? "s" : ""} released for recycling.`,
+        kind: "success",
+      }
+    }
+
+    rerender()
+  })()
+}
+
 /** Refresh the worktree list and reset selection state. */
 async function refreshWorktrees(state: State): Promise<void> {
   const allWorktrees = await listWorktrees()
@@ -548,6 +746,7 @@ async function refreshWorktrees(state: State): Promise<void> {
       sessionInfo: { type: "loading" as const },
       parentSession: { type: "loading" as const },
       deleteStatus: null,
+      releaseStatus: null,
     }))
 
   state.selected.clear()
@@ -809,10 +1008,10 @@ function startSizeFetching(state: State, rerender: () => void): void {
 async function handleBrowseKey(state: State, key: Key): Promise<void> {
   const ch = keyChar(key)
 
-  // Navigation (collapse expand on cursor move, skip items being deleted)
+  // Navigation (collapse expand on cursor move, skip items being deleted/released)
   if (key === "up" || ch === "k") {
     let next = state.cursor - 1
-    while (next >= 0 && state.items[next]?.deleteStatus) next--
+    while (next >= 0 && (state.items[next]?.deleteStatus || state.items[next]?.releaseStatus)) next--
     if (next >= 0) state.cursor = next
     state.expandedIndex = null
     state.expandedFiles = null
@@ -821,7 +1020,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
   }
   if (key === "down" || ch === "j") {
     let next = state.cursor + 1
-    while (next < state.items.length && state.items[next]?.deleteStatus) next++
+    while (next < state.items.length && (state.items[next]?.deleteStatus || state.items[next]?.releaseStatus)) next++
     if (next < state.items.length) state.cursor = next
     state.expandedIndex = null
     state.expandedFiles = null
@@ -829,9 +1028,9 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     return
   }
 
-  // Selection (skip items being deleted)
+  // Selection (skip items being deleted/released)
   if (key === "space") {
-    if (state.items[state.cursor]?.deleteStatus) return
+    if (state.items[state.cursor]?.deleteStatus || state.items[state.cursor]?.releaseStatus) return
     if (state.selected.has(state.cursor)) {
       state.selected.delete(state.cursor)
     } else {
@@ -877,6 +1076,35 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     }
 
     state.mode = { type: "confirm-delete", indices }
+    state.message = null
+    return
+  }
+
+  // Release (for recycling)
+  if (ch === "c") {
+    const indices =
+      state.selected.size > 0
+        ? Array.from(state.selected).sort((a, b) => a - b)
+        : [state.cursor]
+
+    // Guard: skip locked worktrees
+    const lockedItems = indices.filter((i) => state.items[i]?.worktree.isLocked)
+    if (lockedItems.length > 0) {
+      state.message = {
+        text: "Cannot release locked worktree(s). Unlock first.",
+        kind: "error",
+      }
+      return
+    }
+
+    // Filter to only items that have branches (detached ones are already released)
+    const releasable = indices.filter((i) => !state.items[i]?.worktree.isDetached)
+    if (releasable.length === 0) {
+      state.message = { text: "Already detached.", kind: "info" }
+      return
+    }
+
+    state.mode = { type: "confirm-release", indices: releasable }
     state.message = null
     return
   }
@@ -1005,6 +1233,28 @@ async function handleConfirmForceKey(
   }
 }
 
+/** Process a keypress in confirm-release mode. */
+async function handleConfirmReleaseKey(
+  state: State,
+  key: Key,
+  indices: number[],
+): Promise<void> {
+  const ch = keyChar(key)
+
+  if (ch === "y" || ch === "b") {
+    const withBranch = ch === "b"
+    state.mode = { type: "browse" }
+    startRelease(state, indices, withBranch, () => render(state))
+    return
+  }
+
+  if (ch === "n" || key === "escape") {
+    state.mode = { type: "browse" }
+    state.message = null
+    return
+  }
+}
+
 /** Process a keypress in confirm-prune mode. */
 async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
   const ch = keyChar(key)
@@ -1069,11 +1319,14 @@ async function printListAndExit(): Promise<void> {
   for (let i = 0; i < worktrees.length; i++) {
     const wt = worktrees[i]
     const branch = wt.branch ?? "(detached)"
-    const sha = wt.head.slice(0, 7)
     const tags: string[] = []
     if (wt.isMain) tags.push(c.cyan("main"))
     if (wt.isLocked) tags.push(c.yellow("locked"))
     if (wt.isPrunable) tags.push(c.red("prunable"))
+    // Tier 1 recyclable: detached + clean (no PR data needed)
+    if (!wt.isMain && wt.isDetached && fileStatuses[i].type === "clean") {
+      tags.push(c.green("recyclable"))
+    }
     const tagStr = tags.length > 0 ? `  ${tags.join(" ")}` : ""
 
     const home = process.env.HOME ?? ""
@@ -1085,7 +1338,7 @@ async function printListAndExit(): Promise<void> {
     const parentSuffix = parentInline ? `  ${parentInline}` : ""
 
     console.log(
-      `  ${branch.padEnd(35)} ${c.dim(sha)}  ${c.dim(path)}${tagStr}${parentSuffix}`,
+      `  ${branch.padEnd(35)} ${c.dim(path)}${tagStr}${parentSuffix}`,
     )
 
     // Sub-line for dirty file status
@@ -1155,6 +1408,138 @@ async function printListAndExit(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Non-interactive --recycle mode
+// ---------------------------------------------------------------------------
+
+async function recycleAndExit(
+  targetBranch: string,
+  slotPath?: string,
+): Promise<void> {
+  const worktrees = await listWorktrees()
+  const nonMain = worktrees.filter((w) => !w.isMain)
+
+  if (nonMain.length === 0) {
+    console.error("No worktrees to recycle. Create one with `git worktree add`.")
+    process.exit(1)
+  }
+
+  // Fetch file statuses for all worktrees
+  const fileStatuses = await Promise.all(
+    nonMain.map((wt) => fetchWorktreeFileStatus(wt.path)),
+  )
+
+  // Optionally fetch PR statuses for better scoring
+  const ghDiag = await checkGhStatus()
+  let prInfos: (import("./lib/git").PrInfo | null)[] = nonMain.map(() => null)
+  if (ghDiag.type === "available") {
+    prInfos = await Promise.all(
+      nonMain.map((wt) => (wt.branch ? fetchPrForBranch(wt.branch) : null)),
+    )
+  }
+
+  // Score candidates
+  function scoreCandidate(
+    wt: import("./lib/git").Worktree,
+    fs: FileStatusResult,
+    pr: import("./lib/git").PrInfo | null,
+  ): number {
+    if (wt.isLocked) return -1
+    if (fs.type === "dirty") {
+      const s = fs.status
+      if (s.staged > 0 || s.modified > 0 || s.untracked > 0 || s.ahead > 0) return -1
+    }
+    if (fs.type !== "clean" && fs.type !== "dirty") return -1 // loading/error
+
+    if (wt.isDetached) return 100
+    if (pr?.state === "MERGED") return 50
+    if (!pr) return 20
+    return 10
+  }
+
+  let candidate: { wt: typeof nonMain[0]; index: number } | null = null
+
+  if (slotPath) {
+    // Find the specified slot
+    const idx = nonMain.findIndex((wt) => wt.path === slotPath)
+    if (idx === -1) {
+      console.error(`No worktree found at ${slotPath}.`)
+      process.exit(1)
+    }
+    const score = scoreCandidate(nonMain[idx], fileStatuses[idx], prInfos[idx])
+    if (score < 0) {
+      console.error(`Worktree at ${slotPath} is not recyclable (dirty or locked).`)
+      process.exit(1)
+    }
+    candidate = { wt: nonMain[idx], index: idx }
+  } else {
+    // Pick the best candidate
+    let bestScore = -1
+    for (let i = 0; i < nonMain.length; i++) {
+      const score = scoreCandidate(nonMain[i], fileStatuses[i], prInfos[i])
+      if (score > bestScore) {
+        bestScore = score
+        candidate = { wt: nonMain[i], index: i }
+      }
+    }
+  }
+
+  if (!candidate || scoreCandidate(candidate.wt, fileStatuses[candidate.index], prInfos[candidate.index]) < 0) {
+    console.error("No recyclable worktrees found.")
+    console.error("Release an existing one with `fell` (c key), or create a new worktree.")
+    process.exit(1)
+  }
+
+  const wt = candidate.wt
+  const oldBranch = wt.branch
+
+  // Detach HEAD if not already detached
+  if (!wt.isDetached) {
+    const detachResult = await detachHead(wt.path)
+    if (!detachResult.ok) {
+      console.error(`Failed to detach HEAD: ${detachResult.error}`)
+      process.exit(1)
+    }
+  }
+
+  // Delete old branch
+  if (oldBranch) {
+    const branchResult = await deleteBranch(oldBranch, true)
+    if (!branchResult.ok) {
+      console.error(c.dim(`Warning: could not delete branch ${oldBranch}: ${branchResult.error}`))
+    }
+  }
+
+  // Fetch latest from remote
+  const fetchResult = await fetchOrigin(wt.path)
+  if (!fetchResult.ok) {
+    console.error(c.dim(`Warning: fetch failed: ${fetchResult.error}`))
+  }
+
+  // Hash lockfile before checkout
+  const lockBefore = await hashLockfile(wt.path)
+
+  // Checkout new branch
+  const checkoutResult = await checkoutNewBranch(wt.path, targetBranch)
+  if (!checkoutResult.ok) {
+    console.error(`Failed to checkout branch ${targetBranch}: ${checkoutResult.error}`)
+    process.exit(1)
+  }
+
+  // Hash lockfile after checkout and compare
+  const lockAfter = await hashLockfile(wt.path)
+  const lockfileChanged = lockBefore !== null && lockAfter !== null && lockBefore !== lockAfter
+
+  // Output: path on stdout (for piping), status on stderr
+  const label = oldBranch ? `${oldBranch} \u2192 ${targetBranch}` : targetBranch
+  console.error(c.green(`\u2713`) + ` Recycled: ${label}`)
+  if (lockfileChanged) {
+    console.error(c.yellow("\u26A0") + ` Lockfile changed. Run your package manager's install command.`)
+  }
+  // stdout: just the path (for `cd $(fell --recycle branch)`)
+  console.log(wt.path)
+}
+
+// ---------------------------------------------------------------------------
 // Spinner timer (animates loading indicators)
 // ---------------------------------------------------------------------------
 
@@ -1167,7 +1552,7 @@ function startSpinnerTimer(
     const hasLoading = state.items.some(
       (i) => i.prStatus.type === "loading" || i.dirSize.type === "loading",
     )
-    const hasDeleting = state.items.some((i) => i.deleteStatus !== null)
+    const hasDeleting = state.items.some((i) => i.deleteStatus !== null || i.releaseStatus !== null)
     if (hasLoading || hasDeleting) {
       state.spinnerFrame =
         (state.spinnerFrame + 1) % SPINNER_FRAMES.length
@@ -1185,6 +1570,8 @@ async function main() {
     options: {
       help: { type: "boolean", short: "h", default: false },
       list: { type: "boolean", short: "l", default: false },
+      recycle: { type: "string" },
+      slot: { type: "string" },
     },
     allowPositionals: true,
   })
@@ -1196,6 +1583,11 @@ async function main() {
 
   if (values.list) {
     await printListAndExit()
+    process.exit(0)
+  }
+
+  if (values.recycle) {
+    await recycleAndExit(values.recycle, values.slot)
     process.exit(0)
   }
 
@@ -1228,6 +1620,7 @@ async function main() {
       sessionInfo: { type: "loading" },
       parentSession: { type: "loading" },
       deleteStatus: null,
+      releaseStatus: null,
     })),
     mainWorktree,
     cursor: 0,
@@ -1308,6 +1701,10 @@ async function main() {
             state.mode.indices,
             state.mode.withBranch,
           )
+          break
+
+        case "confirm-release":
+          await handleConfirmReleaseKey(state, key, state.mode.indices)
           break
 
         case "confirm-prune":
