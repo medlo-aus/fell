@@ -4,6 +4,7 @@
  */
 
 import { $ } from "bun"
+import { readdir, stat } from "node:fs/promises"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -67,14 +68,10 @@ export type GhDiagnostic =
 // ---------------------------------------------------------------------------
 
 /**
- * Parse `git worktree list --porcelain` into structured data.
+ * Parse the porcelain output of `git worktree list --porcelain` into structured data.
  * The first entry is always the main worktree.
  */
-export async function listWorktrees(): Promise<Worktree[]> {
-  const result = await $`git worktree list --porcelain`.nothrow().quiet()
-  if (result.exitCode !== 0) return []
-
-  const stdout = result.stdout.toString()
+export function parseWorktreeListOutput(stdout: string): Worktree[] {
   const blocks = stdout.trim().split("\n\n")
   const worktrees: Worktree[] = []
 
@@ -128,6 +125,16 @@ export async function listWorktrees(): Promise<Worktree[]> {
 }
 
 /**
+ * List worktrees by running `git worktree list --porcelain` and parsing the output.
+ * The first entry is always the main worktree.
+ */
+export async function listWorktrees(repoDir: string): Promise<Worktree[]> {
+  const result = await $`git -C ${repoDir} worktree list --porcelain`.nothrow().quiet()
+  if (result.exitCode !== 0) return []
+  return parseWorktreeListOutput(result.stdout.toString())
+}
+
+/**
  * Remove a worktree directory and its git administrative tracking.
  * Use force when the worktree has uncommitted changes.
  *
@@ -136,11 +143,12 @@ export async function listWorktrees(): Promise<Worktree[]> {
  * removes the leftover directory manually.
  */
 export async function removeWorktree(
+  repoDir: string,
   path: string,
   force = false,
 ): Promise<{ ok: boolean; error?: string }> {
   const flags = force ? ["--force"] : []
-  const result = await $`git worktree remove ${flags} ${path}`.nothrow().quiet()
+  const result = await $`git -C ${repoDir} worktree remove ${flags} ${path}`.nothrow().quiet()
 
   if (result.exitCode === 0) return { ok: true }
 
@@ -155,7 +163,7 @@ export async function removeWorktree(
 
   if (isZombie) {
     // Prune cleans the stale git reference
-    await $`git worktree prune`.nothrow().quiet()
+    await $`git -C ${repoDir} worktree prune`.nothrow().quiet()
 
     // Remove the leftover directory if it still exists
     await $`rm -rf ${path}`.nothrow().quiet()
@@ -166,24 +174,29 @@ export async function removeWorktree(
   return { ok: false, error: stderr }
 }
 
+/** Parse the verbose output of `git worktree prune --dry-run -v` (from stderr). */
+export function parsePruneOutput(stderr: string): string[] {
+  const output = stderr.trim()
+  if (!output) return []
+  return output.split("\n").filter(Boolean)
+}
+
 /**
  * Dry-run prune to show what stale references would be cleaned.
  * Returns human-readable descriptions of each stale entry.
  * Note: git writes prune verbose output to stderr, not stdout.
  */
-export async function pruneWorktreesDryRun(): Promise<string[]> {
-  const result = await $`git worktree prune --dry-run -v`.nothrow().quiet()
-  const output = result.stderr.toString().trim()
-  if (!output) return []
-  return output.split("\n").filter(Boolean)
+export async function pruneWorktreesDryRun(repoDir: string): Promise<string[]> {
+  const result = await $`git -C ${repoDir} worktree prune --dry-run -v`.nothrow().quiet()
+  return parsePruneOutput(result.stderr.toString())
 }
 
 /** Actually prune stale worktree references. */
-export async function pruneWorktrees(): Promise<{
+export async function pruneWorktrees(repoDir: string): Promise<{
   ok: boolean
   error?: string
 }> {
-  const result = await $`git worktree prune`.nothrow().quiet()
+  const result = await $`git -C ${repoDir} worktree prune`.nothrow().quiet()
   if (result.exitCode !== 0) {
     return { ok: false, error: result.stderr.toString().trim() }
   }
@@ -195,11 +208,12 @@ export async function pruneWorktrees(): Promise<{
  * Force (-D) deletes even when not fully merged.
  */
 export async function deleteBranch(
+  repoDir: string,
   name: string,
   force = false,
 ): Promise<{ ok: boolean; error?: string }> {
   const flag = force ? "-D" : "-d"
-  const result = await $`git branch ${flag} ${name}`.nothrow().quiet()
+  const result = await $`git -C ${repoDir} branch ${flag} ${name}`.nothrow().quiet()
   if (result.exitCode !== 0) {
     return { ok: false, error: result.stderr.toString().trim() }
   }
@@ -210,22 +224,8 @@ export async function deleteBranch(
 // File status (per-worktree)
 // ---------------------------------------------------------------------------
 
-/**
- * Get the working tree status for a specific worktree path.
- * Uses `git -C <path> status --porcelain=v2 --branch` to parse
- * staged, modified, untracked counts and ahead/behind info.
- */
-export async function fetchWorktreeFileStatus(
-  worktreePath: string,
-): Promise<FileStatusResult> {
-  const result =
-    await $`git -C ${worktreePath} status --porcelain=v2 --branch`
-      .nothrow()
-      .quiet()
-
-  if (result.exitCode !== 0) return { type: "error" }
-
-  const stdout = result.stdout.toString()
+/** Parse `git status --porcelain=v2 --branch` output into a FileStatusResult. */
+export function parseFileStatusOutput(stdout: string): FileStatusResult {
   let staged = 0
   let modified = 0
   let untracked = 0
@@ -264,6 +264,23 @@ export async function fetchWorktreeFileStatus(
   }
 }
 
+/**
+ * Get the working tree status for a specific worktree path.
+ * Uses `git -C <path> status --porcelain=v2 --branch` to parse
+ * staged, modified, untracked counts and ahead/behind info.
+ */
+export async function fetchWorktreeFileStatus(
+  worktreePath: string,
+): Promise<FileStatusResult> {
+  const result =
+    await $`git -C ${worktreePath} status --porcelain=v2 --branch`
+      .nothrow()
+      .quiet()
+
+  if (result.exitCode !== 0) return { type: "error" }
+  return parseFileStatusOutput(result.stdout.toString())
+}
+
 // ---------------------------------------------------------------------------
 // Directory size
 // ---------------------------------------------------------------------------
@@ -273,21 +290,19 @@ export type DirSize =
   | { type: "done"; bytes: number }
   | { type: "error" }
 
-/**
- * Get the total size of a directory using `du -sk`.
- * Returns size in bytes. Uses -sk (kilobytes, no follow symlinks)
- * to keep it fast -- avoids traversing linked node_modules twice.
- */
+/** Parse `du -sk` output into a DirSize result. */
+export function parseDuOutput(stdout: string): DirSize {
+  const kb = parseInt(stdout.split("\t")[0], 10)
+  if (isNaN(kb)) return { type: "error" }
+  return { type: "done", bytes: kb * 1024 }
+}
+
+/** Get the total disk usage of a directory via `du -sk`. */
 export async function fetchDirectorySize(
   dirPath: string,
 ): Promise<DirSize> {
-  const result = await $`du -sk ${dirPath}`.nothrow().quiet()
-  if (result.exitCode !== 0) return { type: "error" }
-
-  const kb = parseInt(result.stdout.toString().split("\t")[0], 10)
-  if (isNaN(kb)) return { type: "error" }
-
-  return { type: "done", bytes: kb * 1024 }
+  const result = await $`du -sk ${dirPath}`.quiet().nothrow()
+  return parseDuOutput(result.stdout.toString().trim())
 }
 
 /** Format bytes into a human-readable string (e.g. "9.4 GB", "29 MB"). */
@@ -309,34 +324,21 @@ export interface FileEntry {
   status: "staged" | "modified" | "untracked" | "unmerged"
 }
 
-/**
- * Get the list of changed files in a worktree.
- * Returns individual file paths with their status category.
- */
-export async function fetchWorktreeFileList(
-  worktreePath: string,
-): Promise<FileEntry[]> {
-  const result =
-    await $`git -C ${worktreePath} status --porcelain=v2 --branch`
-      .nothrow()
-      .quiet()
-
-  if (result.exitCode !== 0) return []
-
+/** Parse `git status --porcelain=v2 --branch` output into individual file entries. */
+export function parseFileListOutput(stdout: string): FileEntry[] {
   const entries: FileEntry[] = []
 
-  for (const line of result.stdout.toString().split("\n")) {
+  for (const line of stdout.split("\n")) {
     if (line.startsWith("1 ")) {
       // Ordinary entry: "1 XY sub mH mI mW hH hI path"
       const xy = line.slice(2, 4)
-      const path = line.split("\t")[0]?.split(" ").pop() ?? line.slice(113)
       // Parse path from the fixed-width porcelain v2 format
       const parts = line.split(" ")
       const filePath = parts.slice(8).join(" ")
       if (xy[0] !== ".") entries.push({ path: filePath, status: "staged" })
       else if (xy[1] !== ".") entries.push({ path: filePath, status: "modified" })
     } else if (line.startsWith("2 ")) {
-      // Rename entry: "2 XY sub mH mI mW hH hI X\tscore\tpath\torigPath"
+      // Rename entry: "2 XY sub mH mI mW hH hI Xscore\tpath\torigPath"
       const tabParts = line.split("\t")
       const filePath = tabParts[1] ?? ""
       entries.push({ path: filePath, status: "staged" })
@@ -350,6 +352,22 @@ export async function fetchWorktreeFileList(
   }
 
   return entries
+}
+
+/**
+ * Get the list of changed files in a worktree.
+ * Returns individual file paths with their status category.
+ */
+export async function fetchWorktreeFileList(
+  worktreePath: string,
+): Promise<FileEntry[]> {
+  const result =
+    await $`git -C ${worktreePath} status --porcelain=v2 --branch`
+      .nothrow()
+      .quiet()
+
+  if (result.exitCode !== 0) return []
+  return parseFileListOutput(result.stdout.toString())
 }
 
 /**
@@ -376,22 +394,27 @@ export async function openDirectory(path: string): Promise<void> {
  * Uses `Bun.which` to check the binary exists on PATH, then
  * attempts a lightweight repo query to verify auth/repo access.
  */
-export async function checkGhStatus(): Promise<GhDiagnostic> {
+export async function checkGhStatus(repoDir: string): Promise<GhDiagnostic> {
   // Fast path: check if the binary is on PATH at all
   if (!Bun.which("gh")) {
-    return { type: "not-installed" }
+    return { type: "not-installed" as const }
   }
 
-  // Binary exists - verify it can actually query this repo (auth + repo context)
-  const result = await $`gh repo view --json name`.nothrow().quiet()
-  if (result.exitCode === 0) {
-    return { type: "available" }
+  // Check auth config file (~2ms) instead of spawning gh subprocess (~600ms).
+  // If the hosts file exists, gh is almost certainly authenticated.
+  // Edge case: expired/revoked tokens will cause PR fetches to fail gracefully
+  // (returning null), which is acceptable — the user sees "no PR" not a crash.
+  const home = process.env.HOME
+  if (home) {
+    const hostsFile = Bun.file(`${home}/.config/gh/hosts.yml`)
+    if (await hostsFile.exists()) {
+      return { type: "available" as const }
+    }
   }
 
-  const stderr = result.stderr.toString()
   return {
-    type: "not-authenticated",
-    detail: stderr.trim().split("\n")[0] ?? "unknown error",
+    type: "not-authenticated" as const,
+    detail: "gh auth login required",
   }
 }
 
@@ -399,22 +422,10 @@ export async function checkGhStatus(): Promise<GhDiagnostic> {
 // GitHub PR lookups
 // ---------------------------------------------------------------------------
 
-/**
- * Fetch the most recent PR for a branch via `gh` CLI.
- * Returns null when no PR exists or gh is unavailable.
- */
-export async function fetchPrForBranch(
-  branch: string,
-): Promise<PrInfo | null> {
-  const result =
-    await $`gh pr list --head ${branch} --state all --json number,state,url,title --limit 5`
-      .nothrow()
-      .quiet()
-
-  if (result.exitCode !== 0) return null
-
+/** Parse `gh pr list --json ...` output into the most recent PrInfo, or null. */
+export function parsePrListOutput(stdout: string): PrInfo | null {
   try {
-    const prs = JSON.parse(result.stdout.toString()) as Array<{
+    const prs = JSON.parse(stdout) as Array<{
       number: number
       state: string
       url: string
@@ -434,6 +445,24 @@ export async function fetchPrForBranch(
   } catch {
     return null
   }
+}
+
+/**
+ * Fetch the most recent PR for a branch via `gh` CLI.
+ * Returns null when no PR exists or gh is unavailable.
+ */
+export async function fetchPrForBranch(
+  repoDir: string,
+  branch: string,
+): Promise<PrInfo | null> {
+  const result =
+    await $`gh pr list --head ${branch} --state all --json number,state,url,title --limit 5`
+      .cwd(repoDir)
+      .nothrow()
+      .quiet()
+
+  if (result.exitCode !== 0) return null
+  return parsePrListOutput(result.stdout.toString())
 }
 
 // ---------------------------------------------------------------------------
@@ -460,21 +489,33 @@ export type SessionResult =
  * so `/Users/x/.claude/worktrees/foo` becomes
  * `-Users-x--claude-worktrees-foo` (`.` and `/` both become `-`).
  */
-function encodeClaudeProjectPath(absolutePath: string): string {
+export function encodeClaudeProjectPath(absolutePath: string): string {
   return absolutePath.replace(/[^a-zA-Z0-9]/g, "-")
 }
 
 /**
- * Extract the first user prompt from a Claude Code session JSONL file.
- * Reads only the first ~15 lines for performance -- the user message
- * is almost always within the first few entries.
+ * Read the first N lines from a file by loading only a small byte prefix.
+ * JSONL lines are typically 200-2000 bytes each, so 16KB covers ~15+ lines.
  */
-async function extractFirstPrompt(
+const JSONL_PREFIX_BYTES = 16384
+
+async function readFirstLines(
+  filePath: string,
+  maxLines: number,
+): Promise<string[]> {
+  const text = await Bun.file(filePath).slice(0, JSONL_PREFIX_BYTES).text()
+  return text.split("\n").slice(0, maxLines)
+}
+
+/**
+ * Extract the first user prompt from a Claude Code session JSONL file.
+ * Reads only the first 16KB (covers ~15 lines) rather than the full file.
+ */
+export async function extractFirstPrompt(
   jsonlPath: string,
 ): Promise<{ prompt: string; timestamp: string } | null> {
   try {
-    const content = await Bun.file(jsonlPath).text()
-    const lines = content.split("\n").slice(0, 15)
+    const lines = await readFirstLines(jsonlPath, 15)
 
     for (const line of lines) {
       if (!line.trim()) continue
@@ -522,13 +563,12 @@ async function extractFirstPrompt(
 
 /**
  * Extract the `cwd` from the first parseable line of a JSONL session file.
- * Used by the global scanner to recover the original absolute path
- * without decoding the project directory name (which is lossy).
+ * Reads only the first 16KB rather than the full file.
  */
-async function extractCwd(jsonlPath: string): Promise<string | null> {
+export async function extractCwd(jsonlPath: string): Promise<string | null> {
   try {
-    const content = await Bun.file(jsonlPath).text()
-    for (const line of content.split("\n").slice(0, 10)) {
+    const lines = await readFirstLines(jsonlPath, 10)
+    for (const line of lines) {
       if (!line.trim()) continue
       try {
         const entry = JSON.parse(line)
@@ -543,160 +583,6 @@ async function extractCwd(jsonlPath: string): Promise<string | null> {
   return null
 }
 
-// ---------------------------------------------------------------------------
-// Global session scanner
-// ---------------------------------------------------------------------------
-
-/** A single project directory from ~/.claude/projects/ with session metadata. */
-export interface GlobalProjectEntry {
-  /** The original absolute working directory (extracted from JSONL cwd field). */
-  cwd: string
-  /** Whether this is a Claude Code worktree (path contains .claude/worktrees/). */
-  isWorktree: boolean
-  /** The repo root (path before /.claude/worktrees/, or the cwd itself for main repos). */
-  repoRoot: string
-  /** Worktree name (segment after .claude/worktrees/), null for main repo sessions. */
-  worktreeName: string | null
-  /** Number of session JSONL files. */
-  sessionCount: number
-  /** First user prompt from the most recent session. */
-  latestPrompt: string
-  /** ISO timestamp from the most recent session's first user message. */
-  latestTimestamp: string
-}
-
-/** Sessions grouped by repo root. */
-export interface GlobalRepoGroup {
-  repoRoot: string
-  /** Session entry for the main repo (non-worktree), if any. */
-  main: GlobalProjectEntry | null
-  /** Worktree session entries. */
-  worktrees: GlobalProjectEntry[]
-  /** Total sessions across main + all worktrees. */
-  totalSessions: number
-}
-
-/**
- * Scan ~/.claude/projects/ for all Claude Code sessions across all repos.
- * Groups results by repo root. Excludes the specified repo (usually the
- * current repo, which is already shown in the main worktree list).
- *
- * Returns empty array if ~/.claude doesn't exist or has no sessions.
- * Never throws.
- */
-export async function listGlobalClaudeSessions(
-  excludeRepoRoot?: string,
-): Promise<GlobalRepoGroup[]> {
-  const home = process.env.HOME
-  if (!home) return []
-
-  const projectsDir = `${home}/.claude/projects`
-
-  try {
-    const { readdir, stat } = await import("node:fs/promises")
-    const dirs = await readdir(projectsDir).catch(() => null)
-    if (!dirs || dirs.length === 0) return []
-
-    // Process each project directory concurrently
-    const entries: GlobalProjectEntry[] = []
-    const CONCURRENCY = 8
-    const executing: Promise<void>[] = []
-
-    const processDir = async (dirName: string) => {
-      const dirPath = `${projectsDir}/${dirName}`
-
-      // List JSONL files
-      const files = await readdir(dirPath).catch(() => null)
-      if (!files) return
-      const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"))
-      if (jsonlFiles.length === 0) return
-
-      // Find most recent JSONL by mtime
-      const withMtime = await Promise.all(
-        jsonlFiles.map(async (f) => {
-          const s = await stat(`${dirPath}/${f}`).catch(() => null)
-          return { file: f, mtime: s?.mtimeMs ?? 0 }
-        }),
-      )
-      withMtime.sort((a, b) => b.mtime - a.mtime)
-      const latestFile = withMtime[0].file
-
-      // Extract cwd from the most recent session to get the real path
-      const cwd = await extractCwd(`${dirPath}/${latestFile}`)
-      if (!cwd) return
-
-      // Extract prompt from the most recent session
-      const promptInfo = await extractFirstPrompt(`${dirPath}/${latestFile}`)
-
-      // Determine if this is a worktree session
-      const claudeWtMatch = cwd.match(/^(.+)\/.claude\/worktrees\/([^/]+)/)
-      const cursorWtMatch = cwd.match(
-        /^(.+)\/.cursor\/worktrees\/[^/]+\/([^/]+)/,
-      )
-      const wtMatch = claudeWtMatch ?? cursorWtMatch
-
-      entries.push({
-        cwd,
-        isWorktree: !!wtMatch,
-        repoRoot: wtMatch ? wtMatch[1] : cwd,
-        worktreeName: wtMatch ? wtMatch[2] : null,
-        sessionCount: jsonlFiles.length,
-        latestPrompt: promptInfo?.prompt ?? "",
-        latestTimestamp: promptInfo?.timestamp ?? "",
-      })
-    }
-
-    // Process with concurrency limit
-    for (const dirName of dirs) {
-      const task = processDir(dirName)
-      executing.push(task)
-      task.then(() => {
-        const idx = executing.indexOf(task)
-        if (idx !== -1) executing.splice(idx, 1)
-      })
-      if (executing.length >= CONCURRENCY) {
-        await Promise.race(executing)
-      }
-    }
-    await Promise.all(executing)
-
-    // Group by repo root
-    const groups = new Map<string, GlobalRepoGroup>()
-
-    for (const entry of entries) {
-      // Skip the excluded repo
-      if (excludeRepoRoot && entry.repoRoot === excludeRepoRoot) continue
-
-      let group = groups.get(entry.repoRoot)
-      if (!group) {
-        group = { repoRoot: entry.repoRoot, main: null, worktrees: [], totalSessions: 0 }
-        groups.set(entry.repoRoot, group)
-      }
-
-      group.totalSessions += entry.sessionCount
-
-      if (entry.isWorktree) {
-        group.worktrees.push(entry)
-      } else {
-        group.main = entry
-      }
-    }
-
-    // Sort groups by total session count descending
-    const result = Array.from(groups.values())
-    result.sort((a, b) => b.totalSessions - a.totalSessions)
-
-    // Sort worktrees within each group by session count descending
-    for (const group of result) {
-      group.worktrees.sort((a, b) => b.sessionCount - a.sessionCount)
-    }
-
-    return result
-  } catch {
-    return []
-  }
-}
-
 /**
  * Look up Claude Code session info for a worktree by reading
  * `~/.claude/projects/{encoded-path}/` directly.
@@ -709,19 +595,18 @@ export async function fetchWorktreeSessionInfo(
   worktreePath: string,
 ): Promise<SessionResult> {
   const home = process.env.HOME
-  if (!home) return { type: "none" }
+  if (!home) return { type: "none" as const }
 
   const encoded = encodeClaudeProjectPath(worktreePath)
   const projectDir = `${home}/.claude/projects/${encoded}`
 
   try {
-    const { readdir, stat } = await import("node:fs/promises")
     const entries = await readdir(projectDir).catch(() => null)
-    if (!entries) return { type: "none" }
+    if (!entries) return { type: "none" as const }
 
     // Find all .jsonl files (each is a session)
     const jsonlFiles = entries.filter((e) => e.endsWith(".jsonl"))
-    if (jsonlFiles.length === 0) return { type: "none" }
+    if (jsonlFiles.length === 0) return { type: "none" as const }
 
     // Sort by mtime descending to find the most recent session
     const withMtime = await Promise.all(
@@ -741,7 +626,7 @@ export async function fetchWorktreeSessionInfo(
     )
 
     return {
-      type: "found",
+      type: "found" as const,
       info: {
         sessionCount: jsonlFiles.length,
         latestSessionId,
@@ -750,7 +635,7 @@ export async function fetchWorktreeSessionInfo(
       },
     }
   } catch {
-    return { type: "none" }
+    return { type: "none" as const }
   }
 }
 
@@ -849,7 +734,7 @@ export async function findParentSession(
   worktreePath: string,
 ): Promise<ParentSessionResult> {
   const home = process.env.HOME
-  if (!home) return { type: "none" }
+  if (!home) return { type: "none" as const }
 
   const sessionsDir = `${home}/.claude/sessions`
   const projectsDir = `${home}/.claude/projects`
@@ -863,7 +748,6 @@ export async function findParentSession(
   if (!wtSuffix) return { type: "none" }
 
   try {
-    const { readdir } = await import("node:fs/promises")
     const sessionFiles = await readdir(sessionsDir).catch(() => null)
     if (!sessionFiles) return { type: "none" }
 
@@ -894,7 +778,7 @@ export async function findParentSession(
       }
     }
 
-    if (activeSessions.length === 0) return { type: "none" }
+    if (activeSessions.length === 0) return { type: "none" as const }
 
     // Step 2: grep each session's JSONL for the worktree path.
     // Run concurrently -- each grep -l short-circuits on first match.
@@ -908,13 +792,13 @@ export async function findParentSession(
     )
 
     const match = grepResults.find((r) => r.matched)
-    if (!match) return { type: "none" }
+    if (!match) return { type: "none" as const }
 
     // Step 3: Extract the first user prompt from the matched session for display
     const promptInfo = await extractFirstPrompt(match.session.jsonlPath)
 
     return {
-      type: "found",
+      type: "found" as const,
       session: {
         sessionId: match.session.sessionId,
         cwd: match.session.cwd,
@@ -922,6 +806,6 @@ export async function findParentSession(
       },
     }
   } catch {
-    return { type: "none" }
+    return { type: "none" as const }
   }
 }

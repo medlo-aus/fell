@@ -58,18 +58,45 @@ import {
 } from "./lib/tui"
 
 // ---------------------------------------------------------------------------
+// Concurrency pool
+// ---------------------------------------------------------------------------
+
+/** Run async tasks with limited concurrency. Fire-and-forget (returns immediately). */
+function runPool<T>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<void>,
+): void {
+  ;(async () => {
+    const executing: Promise<void>[] = []
+    for (const item of items) {
+      const task = fn(item)
+      executing.push(task)
+      task.then(() => {
+        const idx = executing.indexOf(task)
+        if (idx !== -1) executing.splice(idx, 1)
+      })
+      if (executing.length >= concurrency) {
+        await Promise.race(executing)
+      }
+    }
+    await Promise.all(executing)
+  })()
+}
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
 /** In-flight deletion status for an item. Null when not being deleted. */
-type ItemDeleteStatus =
+export type ItemDeleteStatus =
   | { phase: "removing" }
   | { phase: "branch" }
   | { phase: "done"; message: string }
   | { phase: "error"; message: string }
   | { phase: "needs-force" }
 
-interface WorktreeItem {
+export interface WorktreeItem {
   worktree: Worktree
   prStatus: PrStatus
   fileStatus: FileStatusResult
@@ -80,7 +107,7 @@ interface WorktreeItem {
   deleteStatus: ItemDeleteStatus | null
 }
 
-type Mode =
+export type Mode =
   | { type: "browse" }
   | { type: "confirm-delete"; indices: number[] }
   | { type: "confirm-force"; indices: number[]; withBranch: boolean }
@@ -88,7 +115,7 @@ type Mode =
   | { type: "result"; lines: string[] }
   | { type: "help" }
 
-interface State {
+export interface State {
   items: WorktreeItem[]
   mainWorktree: Worktree
   cursor: number
@@ -102,6 +129,12 @@ interface State {
   expandedIndex: number | null
   /** Cached file list for the expanded item. Null while loading. */
   expandedFiles: FileEntry[] | null
+  /** Resolved path to the target repository. */
+  repoDir: string
+  /** First visible item index for viewport scrolling. */
+  scrollOffset: number
+  /** True while an async delete operation is in flight. Gates refresh/delete/select. */
+  isDeleting: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +145,9 @@ function setupTerminal(): void {
   term.enterAltScreen()
   term.hideCursor()
   term.clearScreen()
+  // Enable mouse tracking for scroll wheel support
+  process.stdout.write("\x1b[?1000h") // X10 mouse
+  process.stdout.write("\x1b[?1006h") // SGR extended mouse
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(true)
   }
@@ -119,6 +155,9 @@ function setupTerminal(): void {
 }
 
 function cleanupTerminal(): void {
+  // Disable mouse tracking
+  process.stdout.write("\x1b[?1006l")
+  process.stdout.write("\x1b[?1000l")
   if (process.stdin.isTTY) {
     process.stdin.setRawMode(false)
   }
@@ -144,7 +183,7 @@ const SHA_COL = 7
  * Build lines for a single worktree entry.
  * Returns the main row + an optional indented sub-line for dirty file status.
  */
-function renderRow(
+export function renderRow(
   item: WorktreeItem,
   index: number,
   state: State,
@@ -305,9 +344,57 @@ function render(state: State): void {
   if (state.mode.type === "help") {
     lines.push(...renderHelpLines())
   } else {
-    // Worktree list (each item may produce 1-2 lines)
+    // Calculate viewport: how many item-rows can we fit?
+    // Reserve lines for: title(3) + main worktree(2) + footer detail(3) + message(2) + keyhints(2) + padding(2) = ~14
+    const termRows = process.stdout.rows ?? 40
+    const reservedLines = 14
+    const availableLines = Math.max(3, termRows - reservedLines)
+
+    // Pre-render all rows to know their line counts
+    const allRendered: { lines: string[]; index: number }[] = []
     for (let i = 0; i < state.items.length; i++) {
-      lines.push(...renderRow(state.items[i], i, state))
+      allRendered.push({ lines: renderRow(state.items[i], i, state), index: i })
+    }
+
+    // Ensure cursor is visible by adjusting scrollOffset
+    if (state.cursor < state.scrollOffset) {
+      state.scrollOffset = state.cursor
+    }
+    // Scroll down: accumulate lines from scrollOffset until cursor item is fully visible
+    let linesUsed = 0
+    for (let i = state.scrollOffset; i <= state.cursor && i < allRendered.length; i++) {
+      linesUsed += allRendered[i].lines.length
+    }
+    while (linesUsed > availableLines && state.scrollOffset < state.cursor) {
+      linesUsed -= allRendered[state.scrollOffset].lines.length
+      state.scrollOffset++
+    }
+
+    // Determine visible range from scrollOffset that fits in availableLines
+    let visibleEnd = state.scrollOffset
+    let totalLines = 0
+    while (visibleEnd < allRendered.length) {
+      const rowLines = allRendered[visibleEnd].lines.length
+      if (totalLines + rowLines > availableLines) break
+      totalLines += rowLines
+      visibleEnd++
+    }
+
+    // Scroll indicators
+    const hiddenAbove = state.scrollOffset
+    const hiddenBelow = state.items.length - visibleEnd
+
+    if (hiddenAbove > 0) {
+      lines.push(`  ${c.dim(`  ↑ ${hiddenAbove} more above`)}`)
+    }
+
+    // Render visible items
+    for (let i = state.scrollOffset; i < visibleEnd; i++) {
+      lines.push(...allRendered[i].lines)
+    }
+
+    if (hiddenBelow > 0) {
+      lines.push(`  ${c.dim(`  ↓ ${hiddenBelow} more below`)}`)
     }
 
     // Focused item detail: full path + PR title
@@ -439,6 +526,7 @@ function startDelete(
   rerender: () => void,
 ): void {
   // Mark items as deleting. Stay in browse mode so the list stays visible.
+  state.isDeleting = true
   for (const idx of indices) {
     if (state.items[idx]) {
       state.items[idx].deleteStatus = { phase: "removing" }
@@ -460,7 +548,7 @@ function startDelete(
       item.deleteStatus = { phase: "removing" }
       rerender()
 
-      const removeResult = await removeWorktree(wt.path, force)
+      const removeResult = await removeWorktree(state.repoDir, wt.path, force)
 
       if (removeResult.ok) {
         // Step 2 (optional): delete branch
@@ -468,7 +556,7 @@ function startDelete(
           item.deleteStatus = { phase: "branch" }
           rerender()
 
-          const branchResult = await deleteBranch(wt.branch, true)
+          const branchResult = await deleteBranch(state.repoDir, wt.branch, true)
           if (branchResult.ok) {
             item.deleteStatus = { phase: "done", message: "worktree + branch removed" }
           } else {
@@ -498,43 +586,51 @@ function startDelete(
     // Brief pause so the user can see the final status of each item
     await Bun.sleep(600)
 
-    // Remove successfully deleted items from the list
-    const removedIndices = new Set(
-      indices.filter((idx) => state.items[idx]?.deleteStatus?.phase === "done"),
+    // Remove successfully deleted items from the list.
+    // Use item references (not indices) to be safe against array mutations.
+    const doneItems = new Set(
+      state.items.filter((it) => it.deleteStatus?.phase === "done"),
     )
     // Clear delete status on items that weren't removed (errors, needs-force)
-    for (const idx of indices) {
-      if (state.items[idx] && !removedIndices.has(idx)) {
-        state.items[idx].deleteStatus = null
+    for (const item of state.items) {
+      if (item.deleteStatus && !doneItems.has(item)) {
+        item.deleteStatus = null
       }
     }
 
-    if (removedIndices.size > 0) {
-      // Rebuild item list without deleted items
-      state.items = state.items.filter((_, i) => !removedIndices.has(i))
+    if (doneItems.size > 0) {
+      state.items = state.items.filter((it) => !doneItems.has(it))
       state.cursor = Math.min(state.cursor, Math.max(0, state.items.length - 1))
     }
+
+    // Clean up selected set: remove any indices beyond the new array bounds
+    const validSelected = new Set<number>()
+    for (const idx of state.selected) {
+      if (idx < state.items.length) validSelected.add(idx)
+    }
+    state.selected = validSelected
 
     if (needsForce) {
       state.message = {
         text: "Some worktrees have uncommitted changes. Select and press d to force.",
         kind: "error",
       }
-    } else if (removedIndices.size > 0) {
-      const n = removedIndices.size
+    } else if (doneItems.size > 0) {
+      const n = doneItems.size
       state.message = {
         text: `${n} worktree${n > 1 ? "s" : ""} removed.`,
         kind: "success",
       }
     }
 
+    state.isDeleting = false
     rerender()
   })()
 }
 
 /** Refresh the worktree list and reset selection state. */
 async function refreshWorktrees(state: State): Promise<void> {
-  const allWorktrees = await listWorktrees()
+  const allWorktrees = await listWorktrees(state.repoDir)
   const main = allWorktrees.find((w) => w.isMain)
   if (main) state.mainWorktree = main
 
@@ -596,13 +692,9 @@ function startPrFetching(state: State, rerender: () => void): void {
     }
   }
 
-  // Concurrent fetch with limited parallelism
-  const executing: Promise<void>[] = []
-
-  const fetchOne = async ({ branch, index }: { branch: string; index: number }) => {
+  runPool(branches, PR_CONCURRENCY, async ({ branch, index }) => {
     try {
-      const pr = await fetchPrForBranch(branch)
-      // Guard against stale index (list may have been refreshed)
+      const pr = await fetchPrForBranch(state.repoDir, branch)
       if (state.items[index]?.worktree.branch === branch) {
         state.items[index].prStatus = pr
           ? { type: "found", pr }
@@ -617,31 +709,14 @@ function startPrFetching(state: State, rerender: () => void): void {
       }
     }
     rerender()
-  }
-
-  ;(async () => {
-    for (const item of branches) {
-      const task = fetchOne(item)
-      executing.push(task)
-      // Remove from pool on completion
-      task.then(() => {
-        const idx = executing.indexOf(task)
-        if (idx !== -1) executing.splice(idx, 1)
-      })
-
-      if (executing.length >= PR_CONCURRENCY) {
-        await Promise.race(executing)
-      }
-    }
-    await Promise.all(executing)
-  })()
+  })
 }
 
 // ---------------------------------------------------------------------------
 // Async file status fetching (background, concurrent)
 // ---------------------------------------------------------------------------
 
-const FILE_STATUS_CONCURRENCY = 6
+const FILE_STATUS_CONCURRENCY = 8
 
 /**
  * Fetch file statuses for all non-main worktrees in background.
@@ -653,12 +728,9 @@ function startFileStatusFetching(state: State, rerender: () => void): void {
     index,
   }))
 
-  const executing: Promise<void>[] = []
-
-  const fetchOne = async ({ path, index }: { path: string; index: number }) => {
+  runPool(entries, FILE_STATUS_CONCURRENCY, async ({ path, index }) => {
     try {
       const result = await fetchWorktreeFileStatus(path)
-      // Guard against stale index (list may have been refreshed)
       if (state.items[index]?.worktree.path === path) {
         state.items[index].fileStatus = result
       }
@@ -668,23 +740,7 @@ function startFileStatusFetching(state: State, rerender: () => void): void {
       }
     }
     rerender()
-  }
-
-  ;(async () => {
-    for (const entry of entries) {
-      const task = fetchOne(entry)
-      executing.push(task)
-      task.then(() => {
-        const idx = executing.indexOf(task)
-        if (idx !== -1) executing.splice(idx, 1)
-      })
-
-      if (executing.length >= FILE_STATUS_CONCURRENCY) {
-        await Promise.race(executing)
-      }
-    }
-    await Promise.all(executing)
-  })()
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -703,9 +759,7 @@ function startSessionFetching(state: State, rerender: () => void): void {
     index,
   }))
 
-  const executing: Promise<void>[] = []
-
-  const fetchOne = async ({ path, index }: { path: string; index: number }) => {
+  runPool(entries, SESSION_CONCURRENCY, async ({ path, index }) => {
     try {
       const result = await fetchWorktreeSessionInfo(path)
       if (state.items[index]?.worktree.path === path) {
@@ -717,23 +771,7 @@ function startSessionFetching(state: State, rerender: () => void): void {
       }
     }
     rerender()
-  }
-
-  ;(async () => {
-    for (const entry of entries) {
-      const task = fetchOne(entry)
-      executing.push(task)
-      task.then(() => {
-        const idx = executing.indexOf(task)
-        if (idx !== -1) executing.splice(idx, 1)
-      })
-
-      if (executing.length >= SESSION_CONCURRENCY) {
-        await Promise.race(executing)
-      }
-    }
-    await Promise.all(executing)
-  })()
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -778,26 +816,26 @@ function startParentSessionFetching(state: State, rerender: () => void): void {
 
 /**
  * Fetch directory sizes for all non-main worktrees in background.
- * Runs sequentially (du is I/O heavy, parallel would thrash disk).
+ * Uses native FS traversal (skipping heavy dirs), so concurrent is fine.
  */
 function startSizeFetching(state: State, rerender: () => void): void {
   ;(async () => {
-    for (let i = 0; i < state.items.length; i++) {
-      const item = state.items[i]
-      const path = item.worktree.path
-      try {
-        const result = await fetchDirectorySize(path)
-        // Guard against stale index
-        if (state.items[i]?.worktree.path === path) {
-          state.items[i].dirSize = result
+    await Promise.all(
+      state.items.map(async (item, i) => {
+        const path = item.worktree.path
+        try {
+          const result = await fetchDirectorySize(path)
+          if (state.items[i]?.worktree.path === path) {
+            state.items[i].dirSize = result
+          }
+        } catch {
+          if (state.items[i]?.worktree.path === path) {
+            state.items[i].dirSize = { type: "error" }
+          }
         }
-      } catch {
-        if (state.items[i]?.worktree.path === path) {
-          state.items[i].dirSize = { type: "error" }
-        }
-      }
-      rerender()
-    }
+        rerender()
+      }),
+    )
   })()
 }
 
@@ -806,11 +844,11 @@ function startSizeFetching(state: State, rerender: () => void): void {
 // ---------------------------------------------------------------------------
 
 /** Process a keypress in browse mode. Returns true if the event was handled. */
-async function handleBrowseKey(state: State, key: Key): Promise<void> {
+export async function handleBrowseKey(state: State, key: Key): Promise<void> {
   const ch = keyChar(key)
 
   // Navigation (collapse expand on cursor move, skip items being deleted)
-  if (key === "up" || ch === "k") {
+  if (key === "up" || ch === "k" || key === "scroll-up") {
     let next = state.cursor - 1
     while (next >= 0 && state.items[next]?.deleteStatus) next--
     if (next >= 0) state.cursor = next
@@ -819,7 +857,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     state.message = null
     return
   }
-  if (key === "down" || ch === "j") {
+  if (key === "down" || ch === "j" || key === "scroll-down") {
     let next = state.cursor + 1
     while (next < state.items.length && state.items[next]?.deleteStatus) next++
     if (next < state.items.length) state.cursor = next
@@ -829,8 +867,12 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     return
   }
 
+  // Ignore unknown keys (mouse events, F-keys, etc.)
+  if (key === "unknown") return
+
   // Selection (skip items being deleted)
   if (key === "space") {
+    if (state.isDeleting) return
     if (state.items[state.cursor]?.deleteStatus) return
     if (state.selected.has(state.cursor)) {
       state.selected.delete(state.cursor)
@@ -846,6 +888,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
 
   // Select / deselect all
   if (ch === "a") {
+    if (state.isDeleting) return
     if (state.selected.size === state.items.length) {
       state.selected.clear()
     } else {
@@ -858,6 +901,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
 
   // Delete
   if (ch === "d") {
+    if (state.isDeleting) return
     const indices =
       state.selected.size > 0
         ? Array.from(state.selected).sort((a, b) => a - b)
@@ -883,10 +927,11 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
 
   // Prune
   if (ch === "p") {
+    if (state.isDeleting) return
     state.message = { text: "Checking for stale references...", kind: "info" }
     render(state)
 
-    const candidates = await pruneWorktreesDryRun()
+    const candidates = await pruneWorktreesDryRun(state.repoDir)
     if (candidates.length === 0) {
       state.message = {
         text: "No stale worktree references found.",
@@ -901,6 +946,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
 
   // Refresh
   if (ch === "r") {
+    if (state.isDeleting) return
     state.message = { text: "Refreshing...", kind: "info" }
     render(state)
     await refreshWorktrees(state)
@@ -960,7 +1006,7 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
 }
 
 /** Process a keypress in confirm-delete mode. */
-async function handleConfirmDeleteKey(
+export async function handleConfirmDeleteKey(
   state: State,
   key: Key,
   indices: number[],
@@ -985,7 +1031,7 @@ async function handleConfirmDeleteKey(
 }
 
 /** Process a keypress in confirm-force mode. */
-async function handleConfirmForceKey(
+export async function handleConfirmForceKey(
   state: State,
   key: Key,
   indices: number[],
@@ -1006,11 +1052,11 @@ async function handleConfirmForceKey(
 }
 
 /** Process a keypress in confirm-prune mode. */
-async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
+export async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
   const ch = keyChar(key)
 
   if (ch === "y") {
-    const result = await pruneWorktrees()
+    const result = await pruneWorktrees(state.repoDir)
     if (result.ok) {
       await refreshWorktrees(state)
       startPrFetching(state, () => render(state))
@@ -1042,9 +1088,9 @@ async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
 // Non-interactive --list mode
 // ---------------------------------------------------------------------------
 
-async function printListAndExit(): Promise<void> {
-  const worktrees = await listWorktrees()
-  const ghDiagnostic = await checkGhStatus()
+async function printListAndExit(repoDir: string): Promise<void> {
+  const worktrees = await listWorktrees(repoDir)
+  const ghDiagnostic = await checkGhStatus(repoDir)
 
   console.log()
   console.log(`  ${c.bold(fellLogo())}  ${c.dim("--list")}`)
@@ -1114,7 +1160,7 @@ async function printListAndExit(): Promise<void> {
     const nonMain = worktrees.filter((w) => !w.isMain && w.branch)
     const results = await Promise.all(
       nonMain.map(async (wt) => {
-        const pr = await fetchPrForBranch(wt.branch!)
+        const pr = await fetchPrForBranch(repoDir, wt.branch!)
         return { branch: wt.branch!, pr }
       }),
     )
@@ -1162,18 +1208,25 @@ function startSpinnerTimer(
   state: State,
   rerender: () => void,
 ): ReturnType<typeof setInterval> {
-  return setInterval(() => {
-    // Animate when there are loading statuses or an active delete in progress
+  const timer = setInterval(() => {
     const hasLoading = state.items.some(
-      (i) => i.prStatus.type === "loading" || i.dirSize.type === "loading",
+      (i) =>
+        i.prStatus.type === "loading" ||
+        i.dirSize.type === "loading" ||
+        i.fileStatus.type === "loading" ||
+        i.sessionInfo.type === "loading" ||
+        i.parentSession.type === "loading",
     )
-    const hasDeleting = state.items.some((i) => i.deleteStatus !== null)
-    if (hasLoading || hasDeleting) {
+    const hasDeleting = state.isDeleting
+    const hasExpandedLoading =
+      state.expandedIndex !== null && state.expandedFiles === null
+    if (hasLoading || hasDeleting || hasExpandedLoading) {
       state.spinnerFrame =
         (state.spinnerFrame + 1) % SPINNER_FRAMES.length
       rerender()
     }
   }, 80)
+  return timer
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,9 +1238,14 @@ async function main() {
     options: {
       help: { type: "boolean", short: "h", default: false },
       list: { type: "boolean", short: "l", default: false },
+      path: { type: "string", short: "p" },
     },
     allowPositionals: true,
   })
+
+  const repoDir = values.path
+    ? require("node:path").resolve(values.path as string)
+    : process.cwd()
 
   if (values.help) {
     printCliHelp()
@@ -1195,7 +1253,7 @@ async function main() {
   }
 
   if (values.list) {
-    await printListAndExit()
+    await printListAndExit(repoDir)
     process.exit(0)
   }
 
@@ -1205,7 +1263,7 @@ async function main() {
     process.exit(1)
   }
 
-  const allWorktrees = await listWorktrees()
+  const allWorktrees = await listWorktrees(repoDir)
   const mainWorktree = allWorktrees.find((w) => w.isMain)
   if (!mainWorktree) {
     console.error("Could not determine main worktree. Are you in a git repo?")
@@ -1239,10 +1297,13 @@ async function main() {
     ghDiagnostic: { type: "checking" },
     expandedIndex: null,
     expandedFiles: null,
+    repoDir,
+    scrollOffset: 0,
+    isDeleting: false,
   }
 
   // Check gh availability (non-blocking, runs before PR fetching starts)
-  checkGhStatus().then((diagnostic) => {
+  checkGhStatus(repoDir).then((diagnostic) => {
     state.ghDiagnostic = diagnostic
     if (diagnostic.type !== "available") {
       // gh unavailable - mark all PR statuses so spinners stop
@@ -1346,13 +1407,16 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  // Ensure terminal is restored even on crash
-  try {
-    cleanupTerminal()
-  } catch {
-    /* ignore */
-  }
-  console.error(c.red("Fatal:"), err instanceof Error ? err.message : err)
-  process.exit(1)
-})
+// Only run when executed directly (not when imported by tests)
+if (import.meta.main) {
+  main().catch((err) => {
+    // Ensure terminal is restored even on crash
+    try {
+      cleanupTerminal()
+    } catch {
+      /* ignore */
+    }
+    console.error(c.red("Fatal:"), err instanceof Error ? err.message : err)
+    process.exit(1)
+  })
+}

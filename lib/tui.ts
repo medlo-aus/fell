@@ -4,7 +4,7 @@
  * and the help screen content.
  */
 
-import type { PrStatus, FileStatusResult, SessionResult, GlobalRepoGroup, ParentSessionResult } from "./git"
+import type { PrStatus, FileStatusResult, SessionResult, ParentSessionResult } from "./git"
 
 // ---------------------------------------------------------------------------
 // ANSI escape helpers
@@ -13,20 +13,25 @@ import type { PrStatus, FileStatusResult, SessionResult, GlobalRepoGroup, Parent
 const ESC = "\x1b"
 const CSI = `${ESC}[`
 
-/** Colour/style wrappers using standard ANSI escape codes. */
+/**
+ * Colour/style wrappers using specific SGR disable codes.
+ * Uses targeted resets (e.g. 22=not-bold/dim, 23=not-italic, 39=default-fg)
+ * instead of full reset (0m) so that nested styles don't clobber each other.
+ * e.g. c.dim(c.italic("text")) → dim stays active after italic closes.
+ */
 export const c = {
-  dim: (s: string) => `${CSI}2m${s}${CSI}0m`,
-  bold: (s: string) => `${CSI}1m${s}${CSI}0m`,
-  italic: (s: string) => `${CSI}3m${s}${CSI}0m`,
-  underline: (s: string) => `${CSI}4m${s}${CSI}0m`,
-  inverse: (s: string) => `${CSI}7m${s}${CSI}0m`,
-  cyan: (s: string) => `${CSI}36m${s}${CSI}0m`,
-  green: (s: string) => `${CSI}32m${s}${CSI}0m`,
-  red: (s: string) => `${CSI}31m${s}${CSI}0m`,
-  yellow: (s: string) => `${CSI}33m${s}${CSI}0m`,
-  magenta: (s: string) => `${CSI}35m${s}${CSI}0m`,
-  white: (s: string) => `${CSI}37m${s}${CSI}0m`,
-  lime: (s: string) => `${CSI}38;5;154m${s}${CSI}0m`,
+  dim: (s: string) => `${CSI}2m${s}${CSI}22m`,
+  bold: (s: string) => `${CSI}1m${s}${CSI}22m`,
+  italic: (s: string) => `${CSI}3m${s}${CSI}23m`,
+  underline: (s: string) => `${CSI}4m${s}${CSI}24m`,
+  inverse: (s: string) => `${CSI}7m${s}${CSI}27m`,
+  cyan: (s: string) => `${CSI}36m${s}${CSI}39m`,
+  green: (s: string) => `${CSI}32m${s}${CSI}39m`,
+  red: (s: string) => `${CSI}31m${s}${CSI}39m`,
+  yellow: (s: string) => `${CSI}33m${s}${CSI}39m`,
+  magenta: (s: string) => `${CSI}35m${s}${CSI}39m`,
+  white: (s: string) => `${CSI}37m${s}${CSI}39m`,
+  lime: (s: string) => `${CSI}38;5;154m${s}${CSI}39m`,
 } as const
 
 /**
@@ -139,11 +144,30 @@ export type Key =
   | "escape"
   | "backspace"
   | "ctrl-c"
+  | "scroll-up"
+  | "scroll-down"
+  | "unknown"
   | { char: string }
 
 /** Parse raw stdin bytes into a Key value. */
 export function parseKey(data: Buffer): Key {
   if (data[0] === 0x1b && data[1] === 0x5b) {
+    // Mouse events: \x1b[M followed by button + coords (3 bytes)
+    // or \x1b[< SGR mouse format. Ignore all mouse input.
+    if (data[2] === 0x4d && data.length >= 6) {
+      // X10 mouse: byte 3 encodes button. 0x60=scroll-up, 0x61=scroll-down
+      const btn = data[3] & 0xff
+      if (btn === 0x60) return "scroll-up"
+      if (btn === 0x61) return "scroll-down"
+      return "unknown"
+    }
+    if (data[2] === 0x3c) {
+      // SGR mouse: \x1b[<btn;x;yM or \x1b[<btn;x;ym
+      const str = data.toString("utf8")
+      if (str.includes("64;")) return "scroll-up"
+      if (str.includes("65;")) return "scroll-down"
+      return "unknown"
+    }
     switch (data[2]) {
       case 0x41:
         return "up"
@@ -154,6 +178,8 @@ export function parseKey(data: Buffer): Key {
       case 0x44:
         return "left"
     }
+    // Other CSI sequences (F-keys, etc.) — ignore
+    return "unknown"
   }
   switch (data[0]) {
     case 0x03:
@@ -312,105 +338,6 @@ export function formatParentSessionExpanded(
 // Global session rendering
 // ---------------------------------------------------------------------------
 
-/**
- * Render the "other repos" global session section for the TUI.
- * Shows a compact summary of sessions grouped by repo.
- */
-export function renderGlobalSessionLines(
-  groups: GlobalRepoGroup[],
-  maxWidth: number,
-): string[] {
-  if (groups.length === 0) return []
-
-  const totalRepos = groups.length
-  const totalWorktrees = groups.reduce((sum, g) => sum + g.worktrees.length, 0)
-  const totalSessions = groups.reduce((sum, g) => sum + g.totalSessions, 0)
-
-  const lines: string[] = []
-  lines.push("")
-  lines.push(
-    `  ${c.dim(`${totalRepos} other repo${totalRepos === 1 ? "" : "s"}`)} ${c.dim("\u00B7")} ${c.dim(`${totalWorktrees} worktree${totalWorktrees === 1 ? "" : "s"}`)} ${c.dim("\u00B7")} ${c.dim(`${totalSessions} session${totalSessions === 1 ? "" : "s"}`)}`,
-  )
-
-  for (const group of groups) {
-    const home = process.env.HOME ?? ""
-    let repoDisplay = group.repoRoot
-    if (home && repoDisplay.startsWith(home)) {
-      repoDisplay = "~" + repoDisplay.slice(home.length)
-    }
-
-    const wtCount = group.worktrees.length
-    const sessCount = group.totalSessions
-
-    lines.push(
-      `    ${c.dim(truncate(repoDisplay, maxWidth - 30))}  ${c.dim(`${wtCount} wt`)} ${c.dim("\u00B7")} ${c.dim(`${sessCount} sess`)}`,
-    )
-
-    // Show worktrees with their latest prompt (compact)
-    for (const wt of group.worktrees.slice(0, 3)) {
-      const name = wt.worktreeName ?? "main"
-      const prompt = wt.latestPrompt
-        ? ` ${c.dim("\u00B7")} ${c.dim(c.italic(`"${truncate(wt.latestPrompt, maxWidth - 40)}"`))}`
-        : ""
-      lines.push(
-        `      ${c.dim("\u25C8")} ${c.dim(name)}${prompt}`,
-      )
-    }
-    if (group.worktrees.length > 3) {
-      lines.push(`      ${c.dim(`... ${group.worktrees.length - 3} more`)}`)
-    }
-  }
-
-  return lines
-}
-
-/**
- * Render global sessions for --list mode (more expanded than TUI).
- */
-export function printGlobalSessions(groups: GlobalRepoGroup[]): void {
-  if (groups.length === 0) return
-
-  console.log()
-  console.log(`  ${c.dim("OTHER REPOS")}`)
-  console.log()
-
-  for (const group of groups) {
-    const home = process.env.HOME ?? ""
-    let repoDisplay = group.repoRoot
-    if (home && repoDisplay.startsWith(home)) {
-      repoDisplay = "~" + repoDisplay.slice(home.length)
-    }
-
-    const parts: string[] = []
-    if (group.worktrees.length > 0) {
-      parts.push(`${group.worktrees.length} worktree${group.worktrees.length === 1 ? "" : "s"}`)
-    }
-    parts.push(`${group.totalSessions} session${group.totalSessions === 1 ? "" : "s"}`)
-
-    console.log(`  ${c.dim(repoDisplay)}  ${c.dim(`(${parts.join(", ")})`)}`)
-
-    // Main repo sessions
-    if (group.main && group.main.sessionCount > 0) {
-      const prompt = group.main.latestPrompt
-        ? `  ${c.dim(c.italic(`"${truncate(group.main.latestPrompt, 60)}"`))}`
-        : ""
-      console.log(
-        `    ${c.dim("\u25C8")} ${c.dim("main")} ${c.dim("\u00B7")} ${c.dim(`${group.main.sessionCount} session${group.main.sessionCount === 1 ? "" : "s"}`)}${prompt}`,
-      )
-    }
-
-    // Worktree sessions
-    for (const wt of group.worktrees) {
-      const name = wt.worktreeName ?? "unknown"
-      const prompt = wt.latestPrompt
-        ? `  ${c.dim(c.italic(`"${truncate(wt.latestPrompt, 60)}"`))}`
-        : ""
-      console.log(
-        `    ${c.dim("\u25C8")} ${c.dim(name)} ${c.dim("\u00B7")} ${c.dim(`${wt.sessionCount} session${wt.sessionCount === 1 ? "" : "s"}`)}${prompt}`,
-      )
-    }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Help screen
@@ -460,6 +387,7 @@ export function printCliHelp(): void {
   console.log()
   console.log(`    ${c.dim("$")} fell            ${c.dim("Interactive mode (default)")}`)
   console.log(`    ${c.dim("$")} fell ${c.cyan("--list")}     ${c.dim("Print worktrees and exit")}`)
+  console.log(`    ${c.dim("$")} fell ${c.cyan("--path")} ${c.dim("<dir>")}  ${c.dim("Target a different repository")}`)
   console.log(`    ${c.dim("$")} fell ${c.cyan("--help")}     ${c.dim("Show this help")}`)
   console.log()
   console.log(c.yellow("  INTERACTIVE COMMANDS"))
