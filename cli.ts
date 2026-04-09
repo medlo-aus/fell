@@ -29,6 +29,7 @@ import {
   fetchDirectorySize,
   formatBytes,
   openDirectory,
+  openInCursor,
   checkGhStatus,
   fetchWorktreeSessionInfo,
   findParentSession,
@@ -56,6 +57,10 @@ import {
   formatParentSessionInline,
   formatParentSessionExpanded,
   fellLogo,
+  getTheme,
+  setTheme,
+  helpContentLines,
+  compositeOverlay,
   renderHelpLines,
   printCliHelp,
   type Key,
@@ -96,6 +101,7 @@ interface WorktreeItem {
 
 type Mode =
   | { type: "browse" }
+  | { type: "open-target" }
   | { type: "confirm-delete"; indices: number[] }
   | { type: "confirm-force"; indices: number[]; withBranch: boolean }
   | { type: "confirm-release"; indices: number[] }
@@ -189,6 +195,8 @@ function getRecyclableStatus(
 // ---------------------------------------------------------------------------
 
 const BRANCH_COL = 30
+const PR_COL = 18
+const SIZE_COL = 10
 const SHA_COL = 7
 
 /**
@@ -272,19 +280,26 @@ function renderRow(
   const isSelected = state.selected.has(index)
 
   const cursor = isFocused ? c.cyan("\u276F") : " "
-  const check = isSelected ? c.lime("\u25CF") : c.dim("\u25CB")
+  const recyclable = getRecyclableStatus(item)
+  let check: string
+  if (isSelected) {
+    check = c.lime("\u25CF")
+  } else if (recyclable === "released") {
+    check = c.green("\u267B")
+  } else if (recyclable === "merged") {
+    check = c.green("\u267B")
+  } else {
+    check = c.dim("\u25CB")
+  }
 
   const branchRaw = wt.branch ?? "(detached)"
   let branchStr = truncate(branchRaw, BRANCH_COL)
   branchStr = isFocused ? c.bold(branchStr) : branchStr
 
-  // Indicators: locked, prunable, recyclable
+  // Indicators: locked, prunable
   const tags: string[] = []
   if (wt.isLocked) tags.push(c.yellow("locked"))
   if (wt.isPrunable) tags.push(c.red("prunable"))
-  const recyclable = getRecyclableStatus(item)
-  if (recyclable === "released") tags.push(c.green("recyclable"))
-  else if (recyclable === "merged") tags.push(c.dim("recyclable"))
   const tagStr = tags.length > 0 ? ` ${tags.join(" ")}` : ""
 
   const pr = formatPrStatus(item.prStatus, state.spinnerFrame)
@@ -312,14 +327,15 @@ function renderRow(
   const parentInline = formatParentSessionInline(item.parentSession)
   const parentSuffix = parentInline ? `  ${parentInline}` : ""
 
-  const mainLine = `  ${cursor} ${check} ${branchPadded}${pad(pr, 18)}${sizeStr}${tagStr}${parentSuffix}`
+  const mainLine = `  ${cursor} ${check} ${branchPadded}${pad(pr, PR_COL)}${pad(sizeStr, SIZE_COL)}${tagStr}${parentSuffix}`
   const lines = [mainLine]
 
-  // Sub-line: dirty file status with warning icon, indented under the branch name
+  // Sub-line: dirty file status, aligned to start at the PR column
+  // Prefix width: "  " + cursor(1) + " " + check(1) + " " + branchPadded(BRANCH_COL+2) = BRANCH_COL + 8
+  const subIndent = " ".repeat(BRANCH_COL + 8)
   const fileStatusLine = formatFileStatus(item.fileStatus)
   if (fileStatusLine) {
-    //       cursor+check+space = "  X X " = 6 chars, then indent to align under branch
-    lines.push(`        ${fileStatusLine}`)
+    lines.push(`${subIndent}${fileStatusLine}`)
   }
 
   // Expanded detail (progressive disclosure via "e" key)
@@ -390,10 +406,8 @@ function render(state: State): void {
   )
   lines.push("")
 
-  if (state.mode.type === "help") {
-    lines.push(...renderHelpLines())
-  } else {
-    // Worktree list (each item may produce 1-2 lines)
+  {
+    // Worktree list (always rendered -- help overlays on top)
     for (let i = 0; i < state.items.length; i++) {
       lines.push(...renderRow(state.items[i], i, state))
     }
@@ -448,11 +462,38 @@ function render(state: State): void {
     }
 
     // Bottom bar: mode-specific key hints
+    // Style: key char highlighted (cyan, or red for destructive), rest of label dim
     lines.push("")
     switch (state.mode.type) {
+      case "help":
       case "browse": {
+        // Hotkey label helpers: embed key in the word
+        const del = `${c.red("d")}${c.dim("elete")}`
+        const rel = `${c.cyan("c")} ${c.dim("release")}`
+        const qut = `${c.cyan("q")}${c.dim("uit")}`
+        const hlp = `${c.cyan("?")}${c.dim("more")}`
+
+        if (state.expandedIndex !== null) {
+          const opn = `${c.cyan("o")}${c.dim("pen")}`
+          const col = `${c.cyan("e")} ${c.dim("collapse")}`
+          lines.push(
+            `  ${opn}  ${col}  ${del}  ${rel}  ${hlp}  ${qut}`,
+          )
+        } else {
+          const nav = `${c.dim("\u2191\u2193 navigate")}`
+          const sel = `${c.dim("\u2423")}${c.dim("select")}`
+          const exp = `${c.cyan("e")}${c.dim("xpand")}`
+          lines.push(
+            `  ${nav}  ${sel}  ${exp}  ${del}  ${rel}  ${hlp}  ${qut}`,
+          )
+        }
+        break
+      }
+      case "open-target": {
+        const fnd = `${c.cyan("f")}${c.dim("inder")}`
+        const cur = `${c.cyan("c")}${c.dim("ursor")}`
         lines.push(
-          `  ${c.dim("\u2191\u2193")} navigate  ${c.dim("\u2423")} select  ${c.dim("a")} all  ${c.dim("e")} expand  ${c.dim("o")} open  ${c.dim("c")} release  ${c.dim("d")} delete  ${c.dim("p")} prune  ${c.dim("?")} help  ${c.dim("q")} quit`,
+          `  ${c.dim("open:")}  ${fnd}  ${cur}  ${c.dim("esc")}`,
         )
         break
       }
@@ -460,7 +501,7 @@ function render(state: State): void {
         const n = state.mode.indices.length
         const s = n > 1 ? "s" : ""
         lines.push(
-          `  Delete ${c.bold(String(n))} worktree${s}?  ${c.cyan("y")} confirm  ${c.cyan("b")} + delete branch${s}  ${c.cyan("n")} cancel`,
+          `  Delete ${c.bold(String(n))} worktree${s}?  ${c.cyan("y")}${c.dim("es")}  ${c.cyan("b")}${c.dim("ranch too")}  ${c.cyan("n")}${c.dim("o")}`,
         )
         break
       }
@@ -468,7 +509,7 @@ function render(state: State): void {
         const n = state.mode.indices.length
         const s = n > 1 ? "s" : ""
         lines.push(
-          `  Worktree${s} ha${n > 1 ? "ve" : "s"} uncommitted changes. Force delete?  ${c.cyan("y")} force  ${c.cyan("n")} cancel`,
+          `  ${c.dim(`Uncommitted changes.`)} Force delete${s}?  ${c.cyan("y")}${c.dim("es")}  ${c.cyan("n")}${c.dim("o")}`,
         )
         break
       }
@@ -476,7 +517,7 @@ function render(state: State): void {
         const n = state.mode.indices.length
         const s = n > 1 ? "s" : ""
         lines.push(
-          `  Release ${c.bold(String(n))} worktree${s} for recycling?  ${c.cyan("y")} confirm  ${c.cyan("b")} + delete branch${s}  ${c.cyan("n")} cancel`,
+          `  Release ${c.bold(String(n))} worktree${s}?  ${c.cyan("y")}${c.dim("es")}  ${c.cyan("b")}${c.dim("ranch too")}  ${c.cyan("n")}${c.dim("o")}`,
         )
         break
       }
@@ -486,7 +527,7 @@ function render(state: State): void {
         }
         lines.push("")
         lines.push(
-          `  Prune ${c.bold(String(state.mode.candidates.length))} stale reference(s)?  ${c.cyan("y")} confirm  ${c.cyan("n")} cancel`,
+          `  Prune ${c.bold(String(state.mode.candidates.length))} stale reference(s)?  ${c.cyan("y")}${c.dim("es")}  ${c.cyan("n")}${c.dim("o")}`,
         )
         break
       }
@@ -503,11 +544,18 @@ function render(state: State): void {
 
   lines.push("")
 
+  // Composite help overlay on top of the rendered content
+  const rows = process.stdout.rows ?? 24
+  let finalLines = lines
+  if (state.mode.type === "help") {
+    finalLines = compositeOverlay(lines, helpContentLines(), rows, cols)
+  }
+
   // Write entire frame at once to prevent flicker.
   // Each line gets an EL (Erase in Line) suffix so that when a line shrinks
   // between frames the leftover characters from the previous render are wiped.
   term.home()
-  process.stdout.write(lines.map((l) => l + term.EL).join("\n"))
+  process.stdout.write(finalLines.map((l) => l + term.EL).join("\n"))
   term.clearBelow()
 }
 
@@ -1164,13 +1212,10 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
     return
   }
 
-  // Open: open focused worktree directory in system file manager
+  // Open: enter open target picker
   if (ch === "o") {
-    const focused = state.items[state.cursor]
-    if (focused) {
-      openDirectory(focused.worktree.path)
-      state.message = { text: `Opened ${shortenPath(focused.worktree.path, 50)}`, kind: "info" }
-    }
+    state.mode = { type: "open-target" }
+    state.message = null
     return
   }
 
@@ -1255,6 +1300,34 @@ async function handleConfirmReleaseKey(
   }
 }
 
+/** Process a keypress in open-target mode. */
+async function handleOpenTargetKey(state: State, key: Key): Promise<void> {
+  const ch = keyChar(key)
+
+  const focused = state.items[state.cursor]
+  if (!focused) {
+    state.mode = { type: "browse" }
+    return
+  }
+
+  if (ch === "f") {
+    openDirectory(focused.worktree.path)
+    state.message = { text: `Opened ${shortenPath(focused.worktree.path, 50)}`, kind: "info" }
+    state.mode = { type: "browse" }
+    return
+  }
+
+  if (ch === "c") {
+    openInCursor(focused.worktree.path)
+    state.message = { text: `Opening in Cursor: ${shortenPath(focused.worktree.path, 50)}`, kind: "info" }
+    state.mode = { type: "browse" }
+    return
+  }
+
+  // Any other key cancels
+  state.mode = { type: "browse" }
+}
+
 /** Process a keypress in confirm-prune mode. */
 async function handleConfirmPruneKey(state: State, key: Key): Promise<void> {
   const ch = keyChar(key)
@@ -1318,15 +1391,13 @@ async function printListAndExit(): Promise<void> {
 
   for (let i = 0; i < worktrees.length; i++) {
     const wt = worktrees[i]
+    const isRecyclable = !wt.isMain && wt.isDetached && fileStatuses[i].type === "clean"
+    const prefix = isRecyclable ? c.green("\u267B") : " "
     const branch = wt.branch ?? "(detached)"
     const tags: string[] = []
     if (wt.isMain) tags.push(c.cyan("main"))
     if (wt.isLocked) tags.push(c.yellow("locked"))
     if (wt.isPrunable) tags.push(c.red("prunable"))
-    // Tier 1 recyclable: detached + clean (no PR data needed)
-    if (!wt.isMain && wt.isDetached && fileStatuses[i].type === "clean") {
-      tags.push(c.green("recyclable"))
-    }
     const tagStr = tags.length > 0 ? `  ${tags.join(" ")}` : ""
 
     const home = process.env.HOME ?? ""
@@ -1338,7 +1409,7 @@ async function printListAndExit(): Promise<void> {
     const parentSuffix = parentInline ? `  ${parentInline}` : ""
 
     console.log(
-      `  ${branch.padEnd(35)} ${c.dim(path)}${tagStr}${parentSuffix}`,
+      `  ${prefix} ${branch.padEnd(35)} ${c.dim(path)}${tagStr}${parentSuffix}`,
     )
 
     // Sub-line for dirty file status
@@ -1600,13 +1671,21 @@ async function main() {
   const allWorktrees = await listWorktrees()
   const mainWorktree = allWorktrees.find((w) => w.isMain)
   if (!mainWorktree) {
-    console.error("Could not determine main worktree. Are you in a git repo?")
+    console.log()
+    console.log(`  ${c.bold(fellLogo())}  ${c.dim("Interactive Worktree Cleanup")}`)
+    console.log()
+    console.log(c.dim("  Could not determine main worktree. Are you in a git repo?"))
+    console.log()
     process.exit(1)
   }
 
   const nonMain = allWorktrees.filter((w) => !w.isMain)
   if (nonMain.length === 0) {
+    console.log()
+    console.log(`  ${c.bold(fellLogo())}  ${c.dim("Interactive Worktree Cleanup")}`)
+    console.log()
     console.log(c.dim("  No worktrees to manage (only main). Nothing to do."))
+    console.log()
     process.exit(0)
   }
 
@@ -1690,6 +1769,10 @@ async function main() {
           await handleBrowseKey(state, key)
           break
 
+        case "open-target":
+          await handleOpenTargetKey(state, key)
+          break
+
         case "confirm-delete":
           await handleConfirmDeleteKey(state, key, state.mode.indices)
           break
@@ -1717,15 +1800,19 @@ async function main() {
           state.message = null
           break
 
-        case "help":
-          if (key === "escape" || keyChar(key) === "?" || keyChar(key) === "q") {
+        case "help": {
+          const hk = keyChar(key)
+          if (key === "escape" || hk === "?" || hk === "q") {
             state.mode = { type: "browse" }
-          }
-          // Quit from help screen
-          if (key === "ctrl-c") {
+          } else if (hk === "l") {
+            setTheme("light")
+          } else if (hk === "d") {
+            setTheme("dark")
+          } else if (key === "ctrl-c") {
             state.shouldQuit = true
           }
           break
+        }
       }
 
       if (!state.shouldQuit) {

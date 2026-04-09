@@ -354,21 +354,64 @@ export type DirSize =
   | { type: "done"; bytes: number }
   | { type: "error" }
 
+// ---------------------------------------------------------------------------
+// Size cache (/tmp/fell-size-cache.json)
+// ---------------------------------------------------------------------------
+
+const SIZE_CACHE_PATH = "/tmp/fell-size-cache.json"
+const SIZE_CACHE_TTL = 10 * 60 * 1000 // 10 minutes
+
+interface SizeCacheEntry { bytes: number; ts: number }
+type SizeCache = Record<string, SizeCacheEntry>
+
+let _sizeCache: SizeCache | null = null
+
+async function loadSizeCache(): Promise<SizeCache> {
+  if (_sizeCache) return _sizeCache
+  try {
+    const file = Bun.file(SIZE_CACHE_PATH)
+    if (await file.exists()) {
+      _sizeCache = JSON.parse(await file.text()) as SizeCache
+      return _sizeCache
+    }
+  } catch { /* corrupt or missing — start fresh */ }
+  _sizeCache = {}
+  return _sizeCache
+}
+
+async function writeSizeCache(cache: SizeCache): Promise<void> {
+  try {
+    await Bun.write(SIZE_CACHE_PATH, JSON.stringify(cache))
+  } catch { /* /tmp write failure — non-fatal */ }
+}
+
 /**
  * Get the total size of a directory using `du -sk`.
  * Returns size in bytes. Uses -sk (kilobytes, no follow symlinks)
  * to keep it fast -- avoids traversing linked node_modules twice.
+ *
+ * Results are cached in /tmp/fell-size-cache.json with a 10-minute TTL.
  */
 export async function fetchDirectorySize(
   dirPath: string,
 ): Promise<DirSize> {
+  const cache = await loadSizeCache()
+  const entry = cache[dirPath]
+  if (entry && (Date.now() - entry.ts) < SIZE_CACHE_TTL) {
+    return { type: "done", bytes: entry.bytes }
+  }
+
   const result = await $`du -sk ${dirPath}`.nothrow().quiet()
   if (result.exitCode !== 0) return { type: "error" }
 
   const kb = parseInt(result.stdout.toString().split("\t")[0], 10)
   if (isNaN(kb)) return { type: "error" }
 
-  return { type: "done", bytes: kb * 1024 }
+  const bytes = kb * 1024
+  cache[dirPath] = { bytes, ts: Date.now() }
+  await writeSizeCache(cache)
+
+  return { type: "done", bytes }
 }
 
 /** Format bytes into a human-readable string (e.g. "9.4 GB", "29 MB"). */
@@ -446,6 +489,13 @@ export async function openDirectory(path: string): Promise<void> {
   } else {
     await $`xdg-open ${path}`.nothrow().quiet()
   }
+}
+
+/**
+ * Open a directory in Cursor IDE.
+ */
+export async function openInCursor(path: string): Promise<void> {
+  await $`cursor ${path}`.nothrow().quiet()
 }
 
 // ---------------------------------------------------------------------------

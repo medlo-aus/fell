@@ -50,7 +50,7 @@ up/down or k/j   Navigate worktree list
 space             Toggle selection
 a                 Select / deselect all
 e                 Expand / collapse file list
-o                 Open worktree in file manager
+o                 Open worktree -> f finder, c cursor
 c                 Release worktree(s) for recycling (detach HEAD)
 d                 Delete worktree(s) + optionally branches
 p                 Prune stale references

@@ -13,24 +13,95 @@ import type { PrStatus, FileStatusResult, SessionResult, GlobalRepoGroup, Parent
 const ESC = "\x1b"
 const CSI = `${ESC}[`
 
-/** Colour/style wrappers using standard ANSI escape codes. */
-export const c = {
-  dim: (s: string) => `${CSI}2m${s}${CSI}0m`,
-  bold: (s: string) => `${CSI}1m${s}${CSI}0m`,
-  italic: (s: string) => `${CSI}3m${s}${CSI}0m`,
-  underline: (s: string) => `${CSI}4m${s}${CSI}0m`,
-  inverse: (s: string) => `${CSI}7m${s}${CSI}0m`,
-  cyan: (s: string) => `${CSI}36m${s}${CSI}0m`,
-  green: (s: string) => `${CSI}32m${s}${CSI}0m`,
-  red: (s: string) => `${CSI}31m${s}${CSI}0m`,
-  yellow: (s: string) => `${CSI}33m${s}${CSI}0m`,
-  magenta: (s: string) => `${CSI}35m${s}${CSI}0m`,
-  white: (s: string) => `${CSI}37m${s}${CSI}0m`,
-  lime: (s: string) => `${CSI}38;5;154m${s}${CSI}0m`,
-} as const
+// ---------------------------------------------------------------------------
+// Theme detection
+// ---------------------------------------------------------------------------
+
+export type Theme = "dark" | "light"
 
 /**
- * Apply a linear gradient across a string using 256-colour ANSI.
+ * Detect terminal background colour.
+ * Checks COLORFGBG (set by iTerm2, xterm, etc.) — format "fg;bg".
+ * bg >= 8 typically means light background.
+ * Falls back to FELL_THEME env var, then defaults to dark.
+ */
+export function detectTheme(): Theme {
+  const explicit = process.env.FELL_THEME?.toLowerCase()
+  if (explicit === "light") return "light"
+  if (explicit === "dark") return "dark"
+
+  const colorfgbg = process.env.COLORFGBG
+  if (colorfgbg) {
+    const parts = colorfgbg.split(";")
+    const bg = parseInt(parts[parts.length - 1], 10)
+    if (!isNaN(bg) && bg >= 8) return "light"
+  }
+
+  return "dark"
+}
+
+// ---------------------------------------------------------------------------
+// Colour helpers (theme-aware, runtime-switchable)
+// ---------------------------------------------------------------------------
+
+/** 256-colour foreground. */
+const fg256 = (n: number, s: string) => `${CSI}38;5;${n}m${s}${CSI}0m`
+/** True-colour foreground. */
+const fgRgb = (r: number, g: number, b: number, s: string) =>
+  `${CSI}38;2;${r};${g};${b}m${s}${CSI}0m`
+
+type Palette = Record<string, (s: string) => string>
+
+const darkPalette: Palette = {
+  dim: (s) => `${CSI}2m${s}${CSI}0m`,
+  bold: (s) => `${CSI}1m${s}${CSI}0m`,
+  italic: (s) => `${CSI}3m${s}${CSI}0m`,
+  underline: (s) => `${CSI}4m${s}${CSI}0m`,
+  inverse: (s) => `${CSI}7m${s}${CSI}0m`,
+  cyan: (s) => `${CSI}36m${s}${CSI}0m`,
+  green: (s) => `${CSI}32m${s}${CSI}0m`,
+  red: (s) => `${CSI}31m${s}${CSI}0m`,
+  yellow: (s) => `${CSI}33m${s}${CSI}0m`,
+  magenta: (s) => `${CSI}35m${s}${CSI}0m`,
+  white: (s) => `${CSI}37m${s}${CSI}0m`,
+  lime: (s) => fg256(154, s),
+}
+
+const lightPalette: Palette = {
+  dim: (s) => fg256(249, s),              // gray-400 — light, widens gap from hotkeys
+  bold: (s) => `${CSI}1m${s}${CSI}0m`,
+  italic: (s) => `${CSI}3m${s}${CSI}0m`,
+  underline: (s) => `${CSI}4m${s}${CSI}0m`,
+  inverse: (s) => `${CSI}7m${s}${CSI}0m`,
+  cyan: (s) => fgRgb(0, 105, 135, s),     // teal-800 — vivid, high contrast vs dim
+  green: (s) => fgRgb(0, 125, 25, s),     // green-800 saturated
+  red: (s) => fgRgb(185, 0, 0, s),        // red-800 vivid
+  yellow: (s) => fgRgb(165, 115, 0, s),   // amber-800 warm
+  magenta: (s) => fgRgb(135, 0, 135, s),  // purple-800 vivid
+  white: (s) => `${CSI}30m${s}${CSI}0m`,  // black on light
+  lime: (s) => fgRgb(30, 130, 0, s),      // lime-800 vivid
+}
+
+/** Current theme — mutable, switched via setTheme(). */
+let _theme: Theme = detectTheme()
+
+/**
+ * Colour wrappers. Stable object reference — methods are swapped
+ * in-place by setTheme() so all importers see the update.
+ */
+export const c: Palette = { ...((_theme === "dark") ? darkPalette : lightPalette) }
+
+/** Get current theme. */
+export function getTheme(): Theme { return _theme }
+
+/** Switch theme at runtime. Updates c in-place. */
+export function setTheme(t: Theme): void {
+  _theme = t
+  Object.assign(c, t === "dark" ? darkPalette : lightPalette)
+}
+
+/**
+ * Apply a linear gradient across a string using true-colour ANSI.
  * Each character gets an interpolated colour between the start and end RGB values.
  */
 export function gradient(
@@ -52,8 +123,11 @@ export function gradient(
     .join("") + `${CSI}0m`
 }
 
-/** Pre-built gradient for the "fell" brand text. Cyan -> lime. */
+/** Pre-built gradient for the "fell" brand text. Theme-aware. */
 export function fellLogo(): string {
+  if (getTheme() === "light") {
+    return gradient("fell", [0, 130, 170], [50, 140, 20])
+  }
   return gradient("fell", [80, 200, 255], [160, 230, 80])
 }
 
@@ -268,7 +342,10 @@ export function formatSessionInfo(
 // ---------------------------------------------------------------------------
 
 /** Orange 256-colour code for Claude/session indicators. */
-const orange = (s: string) => `\x1b[38;5;208m${s}\x1b[0m`
+const orange = (s: string) =>
+  getTheme() === "dark"
+    ? `\x1b[38;5;208m${s}\x1b[0m`
+    : fgRgb(170, 80, 0, s)
 
 /**
  * Render an inline orange dot indicator for worktrees with an active parent session.
@@ -416,42 +493,97 @@ export function printGlobalSessions(groups: GlobalRepoGroup[]): void {
 // Help screen
 // ---------------------------------------------------------------------------
 
-export function renderHelpLines(): string[] {
+/** Content lines for the help overlay (without box). */
+export function helpContentLines(): string[] {
+  const t = getTheme()
+  const themeLabel = t === "dark"
+    ? `${c.bold("\u25CF dark")}  ${c.cyan("(l)")}${c.dim("ight")}`
+    : `${c.cyan("(d)")}${c.dim("ark")}  ${c.bold("\u25CF light")}`
+
   return [
+    `  ${c.bold("Shortcuts")}`,
     "",
-    `  ${c.bold("KEYBINDINGS")}`,
+    `  ${c.cyan("j/k")} or ${c.cyan("\u2191\u2193")}       Navigate`,
+    `  ${c.cyan("space")}            Toggle selection`,
+    `  ${c.cyan("a")}                Select / deselect all`,
+    `  ${c.cyan("e")}                Expand / collapse details`,
+    `  ${c.cyan("o")}                Open \u2192 ${c.cyan("f")} finder  ${c.cyan("c")} cursor`,
+    `  ${c.cyan("c")}                Release for recycling`,
+    `  ${c.cyan("d")}                Delete worktree`,
+    `  ${c.cyan("p")}                Prune stale references`,
+    `  ${c.cyan("r")}                Refresh`,
+    `  ${c.cyan("q")} / ${c.cyan("Esc")}          Quit`,
     "",
-    `    ${c.cyan("up/down")} or ${c.cyan("k/j")}   Navigate`,
-    `    ${c.cyan("space")}             Toggle selection on focused item`,
-    `    ${c.cyan("a")}                 Select / deselect all`,
-    `    ${c.cyan("e")}                 Expand / collapse file list for focused worktree`,
-    `    ${c.cyan("o")}                 Open focused worktree in file manager`,
-    `    ${c.cyan("c")}                 Release focused or selected worktree(s) for recycling`,
-    `    ${c.cyan("d")}                 Delete focused or selected worktree(s)`,
-    `    ${c.cyan("p")}                 Prune stale worktree references`,
-    `    ${c.cyan("r")}                 Refresh list + re-fetch PR statuses`,
-    `    ${c.cyan("?")}                 Toggle this help screen`,
-    `    ${c.cyan("q")} / ${c.cyan("ctrl+c")}        Quit`,
+    `  ${c.dim("Theme")} ${themeLabel}`,
     "",
-    `  ${c.bold("TERMINOLOGY")}`,
-    "",
-    `    ${c.yellow("release")} Detaches HEAD from a worktree without deleting the directory.`,
-    `            The worktree becomes an empty slot with its deps intact,`,
-    `            ready to be recycled for a new branch via ${c.cyan("fell --recycle")}.`,
-    `            ${c.dim("Non-destructive: directory and node_modules stay on disk.")}`,
-    "",
-    `    ${c.yellow("delete")}  ${c.italic("Properly removes")} a worktree: deletes the working directory`,
-    `            and cleans up git tracking. Optionally also force-deletes`,
-    `            the associated branch. Use for worktrees you no longer need.`,
-    `            ${c.dim("Destructive: removes files from disk.")}`,
-    "",
-    `    ${c.yellow("prune")}   Cleans up ${c.italic("stale administrative references")}. When a worktree`,
-    `            directory has been manually deleted (rm -rf) but git still`,
-    `            tracks it, prune removes those orphaned references.`,
-    `            ${c.dim("Safe: only affects already-missing worktrees.")}`,
-    "",
-    `  ${c.dim("press ? or escape to return")}`,
+    `  ${c.dim("? or Esc to close")}`,
   ]
+}
+
+/**
+ * Render a bordered overlay panel centered on the screen.
+ * Takes existing rendered lines and composites the overlay on top.
+ * Uses Unicode box-drawing characters (┌─┐│└─┘).
+ */
+export function compositeOverlay(
+  baseLines: string[],
+  contentLines: string[],
+  termRows: number,
+  termCols: number,
+): string[] {
+  // Calculate overlay dimensions
+  const contentWidth = contentLines.reduce(
+    (max, line) => Math.max(max, visibleLength(line)),
+    0,
+  )
+  const boxWidth = contentWidth + 4 // 2 padding + 2 border chars
+  const boxHeight = contentLines.length + 2 // +2 for top/bottom borders
+
+  // Center the overlay
+  const startRow = Math.max(0, Math.floor((termRows - boxHeight) / 2))
+  const startCol = Math.max(0, Math.floor((termCols - boxWidth) / 2))
+
+  // Pad base lines to fill the screen
+  const output = [...baseLines]
+  while (output.length < termRows) output.push("")
+
+  // Draw the box on top of base lines
+  const top = `\u250C${"─".repeat(boxWidth - 2)}\u2510`
+  const bot = `\u2514${"─".repeat(boxWidth - 2)}\u2518`
+
+  // Helper: overwrite a line at row with overlay content starting at col
+  function overlayLine(row: number, content: string): void {
+    if (row < 0 || row >= output.length) return
+    const base = output[row]
+    const basePlain = stripAnsi(base)
+
+    // Build: left part of base + overlay content + right part of base
+    // For simplicity in alt screen, just pad and replace
+    const leftPad = " ".repeat(startCol)
+    const rightFill = " ".repeat(Math.max(0, termCols - startCol - visibleLength(content)))
+    output[row] = leftPad + content + rightFill
+  }
+
+  // Top border
+  overlayLine(startRow, c.dim(top))
+
+  // Content lines inside the box
+  for (let i = 0; i < contentLines.length; i++) {
+    const line = contentLines[i]
+    const innerPad = " ".repeat(boxWidth - 4 - visibleLength(line))
+    const boxLine = `${c.dim("\u2502")} ${line}${innerPad} ${c.dim("\u2502")}`
+    overlayLine(startRow + 1 + i, boxLine)
+  }
+
+  // Bottom border
+  overlayLine(startRow + 1 + contentLines.length, c.dim(bot))
+
+  return output
+}
+
+/** @deprecated Use helpContentLines() + compositeOverlay() instead. */
+export function renderHelpLines(): string[] {
+  return ["", ...helpContentLines()]
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +608,7 @@ export function printCliHelp(): void {
   console.log(`    ${c.cyan("space")}             Toggle selection`)
   console.log(`    ${c.cyan("a")}                 Select / deselect all`)
   console.log(`    ${c.cyan("e")}                 Expand / collapse file list`)
-  console.log(`    ${c.cyan("o")}                 Open worktree in file manager`)
+  console.log(`    ${c.cyan("o")}                 Open worktree \u2192 ${c.cyan("f")} finder  ${c.cyan("c")} cursor`)
   console.log(`    ${c.cyan("c")}                 Release worktree(s) for recycling (detach HEAD)`)
   console.log(`    ${c.cyan("d")}                 Delete worktree(s) + optionally branches`)
   console.log(`    ${c.cyan("p")}                 Prune stale references`)
