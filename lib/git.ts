@@ -4,6 +4,7 @@
  */
 
 import { $ } from "bun"
+import { readdir } from "node:fs/promises"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -285,6 +286,56 @@ export async function hashLockfile(
     }
   }
   return null
+}
+
+/**
+ * Rename a worktree directory and repair git's internal pointer.
+ * Uses `mv` (instant on same filesystem) then `git worktree repair`
+ * to update <main-repo>/.git/worktrees/<name>/gitdir.
+ *
+ * On repair failure, attempts to roll back the mv.
+ */
+export async function renameWorktree(
+  oldPath: string,
+  newPath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (oldPath === newPath) return { ok: true }
+
+  const mvResult = await $`mv ${oldPath} ${newPath}`.nothrow().quiet()
+  if (mvResult.exitCode !== 0) {
+    return { ok: false, error: mvResult.stderr.toString().trim() }
+  }
+
+  const repairResult = await $`git worktree repair ${newPath}`.nothrow().quiet()
+  if (repairResult.exitCode !== 0) {
+    // Roll back: move it back to the original path
+    await $`mv ${newPath} ${oldPath}`.nothrow().quiet()
+    return { ok: false, error: repairResult.stderr.toString().trim() }
+  }
+
+  return { ok: true }
+}
+
+/**
+ * Find the next available N for a `wt-detached-N` slot in the given directory.
+ * Scans existing entries matching the pattern and returns max + 1.
+ */
+export async function findNextDetachedSlot(parentDir: string): Promise<number> {
+  try {
+    const entries = await readdir(parentDir)
+    const pattern = /^wt-detached-(\d+)$/
+    let maxN = 0
+    for (const entry of entries) {
+      const match = entry.match(pattern)
+      if (match) {
+        const n = parseInt(match[1], 10)
+        if (!isNaN(n) && n > maxN) maxN = n
+      }
+    }
+    return maxN + 1
+  } catch {
+    return 1
+  }
 }
 
 // ---------------------------------------------------------------------------

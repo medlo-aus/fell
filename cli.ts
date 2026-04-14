@@ -13,6 +13,7 @@
  */
 
 import { parseArgs } from "util"
+import { dirname } from "node:path"
 import {
   listWorktrees,
   removeWorktree,
@@ -23,6 +24,8 @@ import {
   fetchOrigin,
   checkoutNewBranch,
   hashLockfile,
+  renameWorktree,
+  findNextDetachedSlot,
   fetchPrForBranch,
   fetchWorktreeFileStatus,
   fetchWorktreeFileList,
@@ -483,8 +486,13 @@ function render(state: State): void {
           const nav = `${c.dim("\u2191\u2193 navigate")}`
           const sel = `${c.dim("\u2423")}${c.dim("select")}`
           const exp = `${c.cyan("e")}${c.dim("xpand")}`
+          // Rename hint only when focused worktree is detached
+          const focusedItem = state.items[state.cursor]
+          const ren = focusedItem?.worktree.isDetached
+            ? `  ${c.cyan("n")} ${c.dim("rename")}`
+            : ""
           lines.push(
-            `  ${nav}  ${sel}  ${exp}  ${del}  ${rel}  ${hlp}  ${qut}`,
+            `  ${nav}  ${sel}  ${exp}  ${del}  ${rel}${ren}  ${hlp}  ${qut}`,
           )
         }
         break
@@ -1154,6 +1162,46 @@ async function handleBrowseKey(state: State, key: Key): Promise<void> {
 
     state.mode = { type: "confirm-release", indices: releasable }
     state.message = null
+    return
+  }
+
+  // Rename (detached worktrees only — assigns wt-detached-N slot name)
+  if (ch === "n") {
+    const focused = state.items[state.cursor]
+    if (!focused || !focused.worktree.isDetached) {
+      return
+    }
+
+    const oldPath = focused.worktree.path
+    const parent = dirname(oldPath)
+
+    ;(async () => {
+      const n = await findNextDetachedSlot(parent)
+      const newPath = `${parent}/wt-detached-${n}`
+
+      if (newPath === oldPath) {
+        state.message = { text: "Already named.", kind: "info" }
+        render(state)
+        return
+      }
+
+      state.message = { text: `Renaming to wt-detached-${n}...`, kind: "info" }
+      render(state)
+
+      const result = await renameWorktree(oldPath, newPath)
+      if (result.ok) {
+        await refreshWorktrees(state)
+        startPrFetching(state, () => render(state))
+        startFileStatusFetching(state, () => render(state))
+        startSessionFetching(state, () => render(state))
+        startParentSessionFetching(state, () => render(state))
+        startSizeFetching(state, () => render(state))
+        state.message = { text: `Renamed to wt-detached-${n}`, kind: "success" }
+      } else {
+        state.message = { text: `Rename failed: ${result.error ?? "unknown"}`, kind: "error" }
+      }
+      render(state)
+    })()
     return
   }
 
