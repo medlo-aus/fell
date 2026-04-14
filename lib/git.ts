@@ -267,6 +267,43 @@ export async function checkoutNewBranch(
 }
 
 /**
+ * Fetch origin and rebase a worktree onto origin/HEAD (the default branch).
+ * Automatically aborts the rebase on conflict so the worktree is never
+ * left in a mid-rebase state (critical for agent automation).
+ */
+export async function rebaseOntoOriginHead(
+  worktreePath: string,
+): Promise<{ ok: boolean; error?: string }> {
+  // Resolve origin/HEAD to the actual ref (e.g. refs/remotes/origin/main)
+  const headRef = await $`git -C ${worktreePath} symbolic-ref refs/remotes/origin/HEAD`
+    .nothrow()
+    .quiet()
+  const target = headRef.exitCode === 0
+    ? headRef.stdout.toString().trim()
+    : "origin/HEAD"
+
+  const result = await $`git -C ${worktreePath} rebase ${target}`
+    .nothrow()
+    .quiet()
+
+  if (result.exitCode === 0) return { ok: true }
+
+  const stderr = result.stderr.toString().trim()
+
+  // Conflict or apply failure: abort to leave tree in a clean state
+  if (
+    stderr.includes("CONFLICT") ||
+    stderr.includes("could not apply") ||
+    stderr.includes("Failed to merge")
+  ) {
+    await $`git -C ${worktreePath} rebase --abort`.nothrow().quiet()
+    return { ok: false, error: "Rebase conflicts detected. Rebase aborted automatically." }
+  }
+
+  return { ok: false, error: stderr }
+}
+
+/**
  * SHA-256 hash of the first lockfile found in a directory.
  * Checks common lockfile names in order. Returns null if none found.
  */

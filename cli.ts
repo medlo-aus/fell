@@ -23,6 +23,7 @@ import {
   detachHead,
   fetchOrigin,
   checkoutNewBranch,
+  rebaseOntoOriginHead,
   hashLockfile,
   renameWorktree,
   findNextDetachedSlot,
@@ -189,6 +190,29 @@ function getRecyclableStatus(
   ) {
     return "merged"
   }
+
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// Worktree resolution (shared by --status, --release, --sync)
+// ---------------------------------------------------------------------------
+
+/**
+ * Find a worktree by exact path or branch name.
+ * Returns null if no match found.
+ */
+function resolveWorktree(
+  target: string,
+  worktrees: Worktree[],
+): Worktree | null {
+  // Exact path match first
+  const byPath = worktrees.find((w) => w.path === target)
+  if (byPath) return byPath
+
+  // Then branch name match
+  const byBranch = worktrees.find((w) => w.branch === target)
+  if (byBranch) return byBranch
 
   return null
 }
@@ -1659,6 +1683,466 @@ async function recycleAndExit(
 }
 
 // ---------------------------------------------------------------------------
+// Non-interactive --list --json mode
+// ---------------------------------------------------------------------------
+
+async function printListJsonAndExit(): Promise<void> {
+  const worktrees = await listWorktrees()
+  const ghDiagnostic = await checkGhStatus()
+  const ghAvailable = ghDiagnostic.type === "available"
+
+  // Fetch all data concurrently
+  const [fileStatuses, sessionInfos, parentSessions, dirSizes] = await Promise.all([
+    Promise.all(worktrees.map((wt) =>
+      wt.isBare ? Promise.resolve({ type: "clean" as const }) : fetchWorktreeFileStatus(wt.path),
+    )),
+    Promise.all(worktrees.map((wt) => fetchWorktreeSessionInfo(wt.path))),
+    Promise.all(worktrees.map((wt) => findParentSession(wt.path))),
+    Promise.all(worktrees.map((wt) =>
+      wt.isBare ? Promise.resolve({ type: "error" as const }) : fetchDirectorySize(wt.path),
+    )),
+  ])
+
+  // Fetch PR info if gh is available
+  let prInfos: (import("./lib/git").PrInfo | null)[] = worktrees.map(() => null)
+  if (ghAvailable) {
+    prInfos = await Promise.all(
+      worktrees.map((wt) => (wt.branch ? fetchPrForBranch(wt.branch) : Promise.resolve(null))),
+    )
+  }
+
+  const result = {
+    worktrees: worktrees.map((wt, i) => {
+      const fs = fileStatuses[i]
+      const pr = prInfos[i]
+
+      // Build minimal WorktreeItem to compute recyclable status
+      const prStatus: PrStatus = pr
+        ? { type: "found" as const, pr }
+        : { type: "none" as const }
+      const recyclable = getRecyclableStatus({
+        worktree: wt,
+        prStatus,
+        fileStatus: fs,
+        dirSize: { type: "loading" },
+        sessionInfo: { type: "loading" },
+        parentSession: { type: "loading" },
+        deleteStatus: null,
+        releaseStatus: null,
+      })
+
+      // File status output
+      let fileStatusOut: Record<string, unknown>
+      if (fs.type === "dirty") {
+        fileStatusOut = { type: "dirty", ...fs.status }
+      } else {
+        fileStatusOut = { type: fs.type }
+      }
+
+      // Session output
+      const sess = sessionInfos[i]
+      const sessionOut = sess.type === "found"
+        ? {
+            sessionCount: sess.info.sessionCount,
+            latestSessionId: sess.info.latestSessionId,
+            latestPrompt: sess.info.latestPrompt,
+            latestTimestamp: sess.info.latestTimestamp,
+          }
+        : null
+
+      // Parent session output
+      const parent = parentSessions[i]
+      const parentOut = parent.type === "found"
+        ? {
+            sessionId: parent.session.sessionId,
+            cwd: parent.session.cwd,
+            prompt: parent.session.prompt,
+          }
+        : null
+
+      // Dir size output
+      const size = dirSizes[i]
+      const sizeOut = size.type === "done" ? { bytes: size.bytes } : null
+
+      return {
+        path: wt.path,
+        branch: wt.branch,
+        head: wt.head,
+        isMain: wt.isMain,
+        isDetached: wt.isDetached,
+        isLocked: wt.isLocked,
+        recyclable,
+        fileStatus: fileStatusOut,
+        pr: pr ? { number: pr.number, state: pr.state, url: pr.url, title: pr.title } : null,
+        session: sessionOut,
+        parentSession: parentOut,
+        dirSize: sizeOut,
+      }
+    }),
+    ghAvailable,
+  }
+
+  console.log(JSON.stringify(result, null, 2))
+}
+
+// ---------------------------------------------------------------------------
+// Non-interactive --status mode
+// ---------------------------------------------------------------------------
+
+async function statusAndExit(
+  target: string,
+  json: boolean,
+): Promise<void> {
+  const worktrees = await listWorktrees()
+  const wt = resolveWorktree(target, worktrees)
+
+  if (!wt) {
+    console.error(`No worktree found matching "${target}".`)
+    process.exit(1)
+  }
+
+  const ghDiagnostic = await checkGhStatus()
+  const ghAvailable = ghDiagnostic.type === "available"
+
+  // Fetch all data concurrently
+  const [fs, sess, parent, size] = await Promise.all([
+    wt.isBare ? Promise.resolve({ type: "clean" as const }) : fetchWorktreeFileStatus(wt.path),
+    fetchWorktreeSessionInfo(wt.path),
+    findParentSession(wt.path),
+    wt.isBare ? Promise.resolve({ type: "error" as const }) : fetchDirectorySize(wt.path),
+  ])
+
+  const pr = ghAvailable && wt.branch ? await fetchPrForBranch(wt.branch) : null
+
+  // Compute recyclable
+  const prStatus: PrStatus = pr ? { type: "found", pr } : { type: "none" }
+  const recyclable = getRecyclableStatus({
+    worktree: wt,
+    prStatus,
+    fileStatus: fs,
+    dirSize: { type: "loading" },
+    sessionInfo: { type: "loading" },
+    parentSession: { type: "loading" },
+    deleteStatus: null,
+    releaseStatus: null,
+  })
+
+  if (json) {
+    let fileStatusOut: Record<string, unknown>
+    if (fs.type === "dirty") {
+      fileStatusOut = { type: "dirty", ...fs.status }
+    } else {
+      fileStatusOut = { type: fs.type }
+    }
+
+    const result = {
+      path: wt.path,
+      branch: wt.branch,
+      head: wt.head,
+      isMain: wt.isMain,
+      isDetached: wt.isDetached,
+      isLocked: wt.isLocked,
+      recyclable,
+      fileStatus: fileStatusOut,
+      pr: pr ? { number: pr.number, state: pr.state, url: pr.url, title: pr.title } : null,
+      session: sess.type === "found"
+        ? {
+            sessionCount: sess.info.sessionCount,
+            latestSessionId: sess.info.latestSessionId,
+            latestPrompt: sess.info.latestPrompt,
+            latestTimestamp: sess.info.latestTimestamp,
+          }
+        : null,
+      parentSession: parent.type === "found"
+        ? {
+            sessionId: parent.session.sessionId,
+            cwd: parent.session.cwd,
+            prompt: parent.session.prompt,
+          }
+        : null,
+      dirSize: size.type === "done" ? { bytes: size.bytes } : null,
+    }
+    console.log(JSON.stringify(result, null, 2))
+    return
+  }
+
+  // Human-readable output
+  const home = process.env.HOME ?? ""
+  let path = wt.path
+  if (home && path.startsWith(home)) path = "~" + path.slice(home.length)
+
+  const branch = wt.branch ?? "(detached)"
+  console.log()
+  console.log(`  ${branch}  ${c.dim(path)}`)
+
+  const sha = c.dim(wt.head.slice(0, 7))
+  console.log(`    sha ${sha}`)
+
+  if (pr) {
+    const stateColor = pr.state === "MERGED" ? c.green : pr.state === "OPEN" ? c.yellow : c.red
+    console.log(`    ${stateColor(`#${pr.number} ${pr.state.toLowerCase()}`)}  ${c.dim(pr.url)}`)
+  }
+
+  if (fs.type === "dirty") {
+    const parts: string[] = []
+    if (fs.status.staged > 0) parts.push(`${fs.status.staged} staged`)
+    if (fs.status.modified > 0) parts.push(`${fs.status.modified} modified`)
+    if (fs.status.untracked > 0) parts.push(`${fs.status.untracked} untracked`)
+    if (fs.status.ahead > 0) parts.push(`${fs.status.ahead} unpushed`)
+    if (fs.status.behind > 0) parts.push(`${fs.status.behind} behind`)
+    console.log(`    ${parts.join("  ")}`)
+  } else {
+    console.log(`    ${c.dim("clean")}`)
+  }
+
+  if (sess.type === "found") {
+    const s = sess.info.sessionCount === 1 ? "session" : "sessions"
+    console.log(`    ${sess.info.sessionCount} ${s}`)
+  }
+
+  if (size.type === "done") {
+    console.log(`    ${formatBytes(size.bytes)}`)
+  }
+
+  if (recyclable) {
+    console.log(`    recyclable: ${c.green(recyclable)}`)
+  }
+
+  const tags: string[] = []
+  if (wt.isMain) tags.push("main")
+  if (wt.isLocked) tags.push("locked")
+  if (wt.isDetached) tags.push("detached")
+  if (tags.length > 0) console.log(`    ${c.dim(tags.join("  "))}`)
+
+  console.log()
+}
+
+// ---------------------------------------------------------------------------
+// Non-interactive --release mode
+// ---------------------------------------------------------------------------
+
+async function releaseAndExit(target: string): Promise<void> {
+  const worktrees = await listWorktrees()
+  const wt = resolveWorktree(target, worktrees)
+
+  if (!wt) {
+    console.error(`No worktree found matching "${target}".`)
+    process.exit(1)
+  }
+
+  if (wt.isMain) {
+    console.error("Cannot release the main worktree.")
+    process.exit(1)
+  }
+
+  if (wt.isDetached) {
+    console.error("Worktree is already detached (released).")
+    process.exit(1)
+  }
+
+  if (wt.isLocked) {
+    console.error("Cannot release a locked worktree. Unlock it first.")
+    process.exit(1)
+  }
+
+  // Check for dirty state
+  const fs = await fetchWorktreeFileStatus(wt.path)
+  if (fs.type === "dirty") {
+    const s = fs.status
+    if (s.staged > 0 || s.modified > 0 || s.untracked > 0 || s.ahead > 0) {
+      const parts: string[] = []
+      if (s.staged > 0) parts.push(`${s.staged} staged`)
+      if (s.modified > 0) parts.push(`${s.modified} modified`)
+      if (s.untracked > 0) parts.push(`${s.untracked} untracked`)
+      if (s.ahead > 0) parts.push(`${s.ahead} unpushed`)
+      console.error(`Cannot release: worktree has uncommitted work (${parts.join(", ")}).`)
+      console.error("Commit, stash, or push before releasing.")
+      process.exit(1)
+    }
+  }
+
+  // Detach HEAD
+  const detachResult = await detachHead(wt.path)
+  if (!detachResult.ok) {
+    console.error(`Failed to detach HEAD: ${detachResult.error}`)
+    process.exit(1)
+  }
+
+  // Delete branch
+  const oldBranch = wt.branch
+  if (oldBranch) {
+    const branchResult = await deleteBranch(oldBranch, true)
+    if (branchResult.ok) {
+      console.error(`Released: ${oldBranch} (branch deleted)`)
+    } else {
+      console.error(`Released: ${oldBranch} (branch delete failed: ${branchResult.error})`)
+    }
+  } else {
+    console.error("Released.")
+  }
+
+  // stdout: path for piping
+  console.log(wt.path)
+}
+
+// ---------------------------------------------------------------------------
+// Non-interactive --clean mode
+// ---------------------------------------------------------------------------
+
+async function cleanAndExit(dryRun: boolean): Promise<void> {
+  const worktrees = await listWorktrees()
+  const nonMain = worktrees.filter((w) => !w.isMain)
+
+  if (nonMain.length === 0) {
+    console.error("No worktrees to clean.")
+    process.exit(0)
+  }
+
+  // Fetch file statuses
+  const fileStatuses = await Promise.all(
+    nonMain.map((wt) => fetchWorktreeFileStatus(wt.path)),
+  )
+
+  // Fetch PR statuses if gh available
+  const ghDiag = await checkGhStatus()
+  const ghAvailable = ghDiag.type === "available"
+  let prInfos: (import("./lib/git").PrInfo | null)[] = nonMain.map(() => null)
+  if (ghAvailable) {
+    prInfos = await Promise.all(
+      nonMain.map((wt) => (wt.branch ? fetchPrForBranch(wt.branch) : Promise.resolve(null))),
+    )
+  } else {
+    console.error("gh CLI unavailable. Only detached+clean worktrees will be cleaned.")
+  }
+
+  // Find recyclable worktrees
+  const candidates: Array<{ wt: Worktree; index: number; reason: string }> = []
+
+  for (let i = 0; i < nonMain.length; i++) {
+    const wt = nonMain[i]
+    const fs = fileStatuses[i]
+    const pr = prInfos[i]
+
+    if (wt.isLocked) continue
+
+    const prStatus: PrStatus = pr ? { type: "found", pr } : { type: "none" }
+    const recyclable = getRecyclableStatus({
+      worktree: wt,
+      prStatus,
+      fileStatus: fs,
+      dirSize: { type: "loading" },
+      sessionInfo: { type: "loading" },
+      parentSession: { type: "loading" },
+      deleteStatus: null,
+      releaseStatus: null,
+    })
+
+    if (recyclable) {
+      candidates.push({ wt, index: i, reason: recyclable })
+    }
+  }
+
+  if (candidates.length === 0) {
+    console.error("Nothing to clean. No recyclable worktrees found.")
+    process.exit(0)
+  }
+
+  if (dryRun) {
+    console.error(`Would clean ${candidates.length} worktree(s):`)
+    for (const { wt, reason } of candidates) {
+      const branch = wt.branch ?? "(detached)"
+      console.error(`  ${branch}  (${reason})  ${wt.path}`)
+    }
+    process.exit(0)
+  }
+
+  // Execute cleanup
+  let cleaned = 0
+  let errors = 0
+
+  for (const { wt, reason } of candidates) {
+    const branch = wt.branch ?? "(detached)"
+
+    const removeResult = await removeWorktree(wt.path, false)
+    if (!removeResult.ok) {
+      // Retry with force
+      const forceResult = await removeWorktree(wt.path, true)
+      if (!forceResult.ok) {
+        console.error(`  ${c.red("\u2717")} ${branch}: ${forceResult.error}`)
+        errors++
+        continue
+      }
+    }
+
+    // Delete branch if it had one
+    if (wt.branch) {
+      await deleteBranch(wt.branch, true)
+    }
+
+    console.error(`  ${c.green("\u2713")} ${branch} (${reason})`)
+    cleaned++
+  }
+
+  // Prune stale refs
+  await pruneWorktrees()
+
+  console.error()
+  if (errors > 0) {
+    console.error(`Cleaned ${cleaned}, ${errors} error(s).`)
+  } else {
+    console.error(`Cleaned ${cleaned} worktree(s).`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Non-interactive --sync mode
+// ---------------------------------------------------------------------------
+
+async function syncAndExit(target: string): Promise<void> {
+  const worktrees = await listWorktrees()
+  const wt = resolveWorktree(target, worktrees)
+
+  if (!wt) {
+    console.error(`No worktree found matching "${target}".`)
+    process.exit(1)
+  }
+
+  if (wt.isMain) {
+    console.error("Cannot sync the main worktree. Use `git pull` directly.")
+    process.exit(1)
+  }
+
+  // Check for dirty state
+  const fs = await fetchWorktreeFileStatus(wt.path)
+  if (fs.type === "dirty") {
+    const s = fs.status
+    if (s.staged > 0 || s.modified > 0) {
+      console.error("Cannot sync: worktree has uncommitted changes. Commit or stash first.")
+      process.exit(1)
+    }
+  }
+
+  // Fetch origin
+  console.error("Fetching origin...")
+  const fetchResult = await fetchOrigin(wt.path)
+  if (!fetchResult.ok) {
+    console.error(`Fetch failed: ${fetchResult.error}`)
+    process.exit(1)
+  }
+
+  // Rebase onto origin/HEAD
+  console.error("Rebasing onto origin/HEAD...")
+  const rebaseResult = await rebaseOntoOriginHead(wt.path)
+  if (!rebaseResult.ok) {
+    console.error(`Sync failed: ${rebaseResult.error}`)
+    process.exit(1)
+  }
+
+  const branch = wt.branch ?? "(detached)"
+  console.error(`Synced: ${branch}`)
+}
+
+// ---------------------------------------------------------------------------
 // Spinner timer (animates loading indicators)
 // ---------------------------------------------------------------------------
 
@@ -1691,6 +2175,13 @@ async function main() {
       list: { type: "boolean", short: "l", default: false },
       recycle: { type: "string" },
       slot: { type: "string" },
+      // Agent automation flags
+      json: { type: "boolean", default: false },
+      clean: { type: "boolean", default: false },
+      "dry-run": { type: "boolean", default: false },
+      release: { type: "string" },
+      sync: { type: "string" },
+      status: { type: "string" },
     },
     allowPositionals: true,
   })
@@ -1701,12 +2192,36 @@ async function main() {
   }
 
   if (values.list) {
-    await printListAndExit()
+    if (values.json) {
+      await printListJsonAndExit()
+    } else {
+      await printListAndExit()
+    }
     process.exit(0)
   }
 
   if (values.recycle) {
     await recycleAndExit(values.recycle, values.slot)
+    process.exit(0)
+  }
+
+  if (values.status) {
+    await statusAndExit(values.status, values.json ?? false)
+    process.exit(0)
+  }
+
+  if (values.release) {
+    await releaseAndExit(values.release)
+    process.exit(0)
+  }
+
+  if (values.clean) {
+    await cleanAndExit(values["dry-run"] ?? false)
+    process.exit(0)
+  }
+
+  if (values.sync) {
+    await syncAndExit(values.sync)
     process.exit(0)
   }
 
